@@ -9,6 +9,7 @@ import numpy as np
 import os 
 from time import time
 import torch 
+import zipfile
 
 from OCD_symphony.utils import working_dir, proj_dir, create_log, today
 
@@ -29,6 +30,17 @@ preproc_label = {
 ts_parc_dict = {'schaefer400_tianS3': parc_dir+'schaefer400_tianS3MNI_lps_mni.nii.gz'}
 
 smoothing_fwhm = {'schaefer400_tianS3': 0}
+
+
+def get_hcp_subj(idx:int) -> str:
+    """ Get subject ID based on index in filename list and extract zip file if not yet done """ 
+    fnames = sorted([f for f in os.listdir(data_dir) if f[-4:]=='.zip'])
+    subj = fnames[idx].split('_')[0]
+    if not subj in sorted([f for f in os.listdir(data_dir) if '.zip' not in f]):
+        logger.info(f"Unzipping HCP files for {subj}")
+        with zipfile.ZipFile(os.path.join(data_dir, fnames[idx]), 'r') as zip_ref:
+            zip_ref.extractall(os.path.join(data_dir))
+    return subj
 
 
 def get_subj_data(subj:str, task='REST') -> list:
@@ -102,11 +114,21 @@ if __name__ == "__main__":
     logger = create_log("make_torch_files_hcp"+today())
     parser = argparse.ArgumentParser()
     parser.add_argument('--subj', action='store', default=None, help='subject to process')
+    parser.add_argument('--n_jobs', action='store', type=int, default=32, help='number of parallel processes')
+    parser.add_argument('--idx', action='store', type=int, default=None, help='index in ordered subjects file list')
     args = parser.parse_args()
 
-    if (args.subj == None):
+    if ((args.subj == None) and (args.idx == None)):
         # loop through everyone and run:
         subj_list = [d for d in os.listdir(data_dir) if os.path.isdir(data_dir+d)]
-        Parallel(n_jobs=1)(delayed(extract_timeseries)(subj, logger=logger) for subj in subj_list)
-    else:
+        Parallel(n_jobs=args.n_jobs)(delayed(extract_timeseries)(subj, logger=logger) for subj in subj_list)
+    
+    elif (args.subj != None):
         extract_timeseries(args.subj, logger=logger)
+    
+    elif (args.idx != None):
+        subj = get_hcp_subj(args.idx)
+        if not os.path.exists(os.path.join(proj_dir, 'data/hcp', subj+'.pt')):
+            extract_timeseries(subj, logger=logger)
+        else:
+            logger.info(f"Subject {subj} was already processed, did not reprocess.")

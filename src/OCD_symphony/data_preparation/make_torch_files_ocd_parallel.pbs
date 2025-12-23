@@ -1,0 +1,37 @@
+#!/bin/bash
+
+##########################################################################
+#
+#  Script:    make_torch_files_parallel.pbs
+#  Author:    Sebastien Naze
+#  Created:   2025-10
+#
+##########################################################################
+
+#PBS -N make_torch_files_parallel
+#PBS -l ncpus=2,mem=32gb,walltime=00:45:00
+#PBS -m abe
+#PBS -M sebastien.naze@qimrberghofer.edu.au
+#PBS -o /working/lab_lucac/sebastiN/projects/OCD_Symphony/.pbs_logs/
+#PBS -e /working/lab_lucac/sebastiN/projects/OCD_Symphony/.pbs_logs/
+#
+# Script to extract time series and FC from fMRI data and store it in torch files
+#
+#module load fsl/6.0.1
+
+#module load miniconda3/current
+
+source activate ocd-symphony
+
+proj_dir=/mnt/lustre/working/lab_lucac/sebastiN/projects/OCD_Symphony/
+#baseline_dir=/mnt/lustre/working/lab_lucac/sebastiN/projects/OCDbaseline/
+#pp_dir=${proj_dir}postprocessing/
+
+# load specific subject from subject list
+mapfile -t subj_array < ${proj_dir}data/subject_list.txt
+IDX=$((PBS_ARRAY_INDEX-1))  # double parenthesis needed for arithmetic operations
+subj=${subj_array[$IDX]}
+echo "Current subject: " ${subj}
+
+echo 'Extracting time series, compute FC, and store in torch file ...'
+python ${proj_dir}src/OCD_symphony/data_preparation/make_torch_files_ocd.py --subj $subj

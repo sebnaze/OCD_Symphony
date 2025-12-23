@@ -19,17 +19,22 @@ class FMRIDataset(Dataset):
         self,
         fmri_data: torch.Tensor,
         fc_data: Optional[torch.Tensor] = None,
-        G_tensor: Optional[torch.Tensor] = None
-    ) -> None:
+        G_tensor: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None 
+        ) -> None:
+        
         assert isinstance(fmri_data, torch.Tensor), "fmri_data must be a torch.Tensor"
         self.fmri_data = fmri_data
         self.fc_data = fc_data
         self.G_tensor = G_tensor
+        self.labels = labels
         n = fmri_data.shape[0]
         if fc_data is not None:
             assert fc_data.shape[0] == n, "fc_data and fmri_data must have same first dim"
         if G_tensor is not None:
             assert G_tensor.shape[0] == n, "G_tensor and fmri_data must have same first dim"
+        if labels is not None:
+            assert labels.shape[0] == n, "labels and fmri_data must have same first dim"
 
     def __len__(self) -> int:
         return self.fmri_data.shape[0]
@@ -40,6 +45,8 @@ class FMRIDataset(Dataset):
             x.append(self.fc_data[idx])
         if self.G_tensor is not None:
             x.append(self.G_tensor[idx])
+        if self.labels is not None:
+            x.append(self.labels[idx])
         return tuple(x)
 
 def load_from_pt(path: str, include: str = '') -> Dict[str, torch.Tensor]:
@@ -78,6 +85,7 @@ def make_dataset_from_pt(path: str, include: str = '') -> FMRIDataset:
         fmri_data=d["fmri_data"],
         fc_data=d.get("fc_data", None),
         G_tensor=d.get("G_tensor", None),
+        labels=d.get("labels", None)
     ), d['subj']
 
 def split_dataset(
