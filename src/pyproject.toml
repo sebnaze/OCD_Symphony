@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+#build-backend = "setuptools.build_meta"
+
+[project]
+name = "OCD_symphony"
+version = "0.1.0"
+#dynamic = ['version']
+description = "Brain Symphony applied to OCD"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.9.12"
+authors = [{ name = "Sebastien Naze", email = "sebastien.naze@gmail.com"}]
+
+#[tool.poetry]
+#version = "0.1.0"
+#packages = [{ include = '.'} ]
+
+[tool.setuptools.packages.find]
+where = ["."]

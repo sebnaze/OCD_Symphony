@@ -1,0 +1,101 @@
+import json
+import matplotlib
+from matplotlib import pyplot as plt
+import nilearn
+import nilearn.image
+import nilearn.plotting
+import numpy as np
+import os
+import scipy
+
+import OCD_symphony
+from OCD_symphony.utils import proj_dir, today
+
+def compute_weights_ttest(all_perceiver_attn:np.array, labels:np.array, head:int=0):
+    """ Compute independent t-test for each brain regions' attention weight""" 
+    hc_inds, = np.where(labels==0)
+    ocd_inds, = np.where(labels==1)
+
+    hc_attn = all_perceiver_attn[hc_inds, head, :, :].squeeze()
+    ocd_attn = all_perceiver_attn[ocd_inds, head, :, :].squeeze()
+
+    # t-test using Welch method (not assuming equal variance)
+    res = scipy.stats.ttest_ind(hc_attn, ocd_attn, axis=0, permutations=500, equal_var=False)
+    return res
+
+
+def compute_significant_pval(res, alpha=0.01):
+    """ Compute significant brain region's p-values """
+    sigp = np.zeros((450,450))
+    row,col = np.where(res[1]<alpha)
+    sigp[row,col] = (1-res[1])[row,col]
+    return sigp, (row,col)
+
+
+def plot_significant_pvals(sigp):
+    """ Plot significant weights' p-values """
+    plt.figure(figsize=(4,4))
+    plt.contourf(sigp, cmap='Grays')
+    plt.colorbar()
+    plt.title('Attention weights (p<0.01)', fontsize=10)
+
+
+def compute_significant_tstat(res, row, col):
+    sigt = np.zeros((450,450))
+    sigt[row,col] = res[0][row,col]
+    return sigt
+
+
+def plot_significant_tstat(sigt):
+    plt.figure(figsize=[4,4])
+    plt.imshow(sigt, cmap='RdBu', vmin=-np.abs(sigt).max(), vmax=np.abs(sigt).max())
+    plt.colorbar()
+    plt.title("T stat (p<0.01)", fontsize=10)
+
+
+def create_attention_brain_image(sigvals:np.array, roi_inds:np.array) :
+    """ Create a brain image from parcellated atlas with regions colorcoded by significance magnitude.
+    
+    Parameters
+    ----------
+        sigvals: np.array
+            Array of significant values
+
+        roi_inds: np.array
+            Indices of the mapping from our Schaefer400_TianS3 to BrainSymphony's. 
+
+    Returns
+    -------
+        attn_img: NIFTII image
+            Formatted brain image with significant regions colorcoded. 
+    """
+    # use t-stat or p-value as threshold (I think t-stat is better)
+    thr = 3*np.std(np.abs(sigvals).sum(axis=0))
+    inds, = np.where(np.abs(sigvals).sum(axis=0)>thr)
+    metric = np.abs(sigvals).sum(axis=0)
+
+    # load atlas img and id/labels pairs
+    with open(os.path.join(proj_dir, 'parcellations', 'atlas_config.json'), 'r') as f:
+        atlas_config = json.load(f)
+    atlas = nilearn.image.load_img(os.path.join(proj_dir, 'parcellations', 'schaefer400_tianS3MNI_lps_mni.nii.gz'))
+
+    # re-org ROI indices: ctx_L, sub-ctx_L, ctx_R, sub-ctx_R
+    reverse_roi_inds = np.concatenate([np.arange(50,250), np.arange(25,50), np.arange(250,450), np.arange(0, 25)])
+
+    # get significant regions names and ids    
+    node_names = np.array(atlas_config['schaefer400_tianS3']['node_names'])[reverse_roi_inds[inds]]
+    node_ids = np.array(atlas_config['schaefer400_tianS3']['node_ids'])[reverse_roi_inds[inds]]
+
+    # create attention brain img
+    attn_map = np.zeros(atlas.get_fdata().shape)
+    for i,node in enumerate(node_ids):
+        x,y,z = np.where(atlas.get_fdata()==node)
+        attn_map[x,y,z] = metric[roi_inds[node-1]]
+        print(f"Node index {node:4} \t {node_names[i]:30} \t : \t {metric[roi_inds[node-1]]:.2f} \t Metric index = {roi_inds[node-1]}")
+
+    attn_img = nilearn.image.new_img_like(atlas, attn_map)
+    return attn_img
+
+
+def plot_attention_brain_image(attn_img):
+    nilearn.plotting.plot_stat_map(attn_img, cmap='RdBu_r', cut_coords=[-44, 50, 4])
