@@ -11,6 +11,19 @@ import scipy
 import OCD_symphony
 from OCD_symphony.utils import proj_dir, today
 
+
+def load_attn_scores():
+    """ Load saved attention score T tests and Niftii image.
+    
+    Return
+    ------
+        attn_heads: list of length 2 (2 heads), each heads is a tuple (TtestResult, Nifti1Image) 
+    """
+    with open(os.path.join(proj_dir, 'results', 'attention_heads_20251202.pkl'), 'rb') as f:
+        attn_heads = pickle.load(f)
+    return attn_heads 
+
+
 def compute_weights_ttest(all_perceiver_attn:np.array, labels:np.array, head:int=0):
     """ Compute independent t-test for each brain regions' attention weight""" 
     hc_inds, = np.where(labels==0)
@@ -99,3 +112,47 @@ def create_attention_brain_image(sigvals:np.array, roi_inds:np.array) :
 
 def plot_attention_brain_image(attn_img):
     nilearn.plotting.plot_stat_map(attn_img, cmap='RdBu_r', cut_coords=[-44, 50, 4])
+
+
+def create_brain_image_from(vals:np.array, inds:np.array, roi_inds:np.array) :
+    """ Create a brain image from parcellated atlas with regions colorcoded by significance magnitude.
+    
+    Parameters
+    ----------
+        vals: np.array
+            Vector array of values used to fill brain image
+
+        inds: np.array
+            Vector array of indices from the original brain symphony space
+
+        roi_inds: np.array
+            Vector array of indices of the mapping from our Schaefer400_TianS3 to BrainSymphony's. 
+
+    Returns
+    -------
+        attn_img: NIFTII image
+            Formatted brain image with regions colorcoded. 
+    """
+    
+
+    # load atlas img and id/labels pairs
+    with open(os.path.join(proj_dir, 'parcellations', 'atlas_config.json'), 'r') as f:
+        atlas_config = json.load(f)
+    atlas = nilearn.image.load_img(os.path.join(proj_dir, 'parcellations', 'schaefer400_tianS3MNI_lps_mni.nii.gz'))
+
+    # re-org ROI indices from Brain Symphony to Schaefer: sub-ctx_R, sub-ctx_L, ctx_L, ctx_R --> ctx_L, sub-ctx_L, ctx_R, sub-ctx_R
+    reverse_roi_inds = np.concatenate([np.arange(50,250), np.arange(25,50), np.arange(250,450), np.arange(0, 25)])
+
+    # get significant regions names and ids from Brain Symph to Schaefer    
+    node_names = np.array(atlas_config['schaefer400_tianS3']['node_names'])[reverse_roi_inds[inds]]
+    node_ids = np.array(atlas_config['schaefer400_tianS3']['node_ids'])[reverse_roi_inds[inds]]
+
+    # create attention brain img
+    attn_map = np.zeros(atlas.get_fdata().shape)
+    for i,node in enumerate(node_ids):
+        x,y,z = np.where(atlas.get_fdata()==node)
+        attn_map[x,y,z] = vals[i]
+        #print(f"Node index {node:4} \t {node_names[i]:30} \t : \t {vals[roi_inds[node-1]]:.2f} \t Metric index = {roi_inds[node-1]}")
+
+    attn_img = nilearn.image.new_img_like(atlas, attn_map)
+    return attn_img, node_names

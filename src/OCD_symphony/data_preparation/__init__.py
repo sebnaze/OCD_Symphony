@@ -1,1 +1,2 @@
 from .make_ocd_dataset import make_dataset_from_pt, FMRIDataset
+from .make_hcp_dataset import make_hcp_dataset_from_pt, load_hcp_from_pt

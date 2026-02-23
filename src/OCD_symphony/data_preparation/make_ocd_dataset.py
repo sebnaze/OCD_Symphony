@@ -71,6 +71,8 @@ def load_from_pt(path: str, include: str = '') -> Dict[str, torch.Tensor]:
             if key in ['fmri_data', 'fc_data', 'G_tensor']:
                 shp = t[key].shape
                 all_tensors[key] = torch.cat([all_tensors[key], t[key].reshape(-1,shp[-2], shp[-1])], dim=0)
+
+        #print(f"{subj} done, {n_samples} samples.")
     
     for key in all_tensors.keys():
         if type(all_tensors[key])!=torch.Tensor:
