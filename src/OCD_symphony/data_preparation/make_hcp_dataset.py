@@ -15,10 +15,7 @@ from typing import Optional, Dict, Tuple
 
 class FMRIDataset(IterableDataset):
     """
-    Simple dataset that returns a tuple of available modalities:
-    - (fmri, fc, G) if all are provided
-    - (fmri, fc)    if fmri and fc are provided
-    - (fmri,)       if only fmri is provided
+    Iterable dataset that returns a tuple of available modalities: (fmri_data, fc_data, G_tensor) for each sample.
     """
     def __init__(self, fnames, mu, sigma) -> None:
         self.fnames = fnames
@@ -41,7 +38,7 @@ def load_hcp_from_pt(fpath: str) -> Dict[str, torch.Tensor]:
     tnsr = torch.load(fpath, map_location='cpu', weights_only=True)
 
     all_tensors = {key:torch.Tensor() for key in tnsr.keys()}
-    all_tensors['subj'] = []
+    all_tensors['subj'] = [] # type: ignore
     
     # ad-hoc extraction of subject id from file name
     subj = os.path.basename(fpath)[:-3] 
@@ -57,7 +54,7 @@ def load_hcp_from_pt(fpath: str) -> Dict[str, torch.Tensor]:
     
     for key in all_tensors.keys():
         if type(all_tensors[key])!=torch.Tensor:
-            all_tensors[key] = np.array(all_tensors[key]).reshape(-1,)
+            all_tensors[key] = np.array(all_tensors[key]).reshape(-1,) # type: ignore
         #print(f"all_tensors[{key}].shape : \t{all_tensors[key].shape}")
 
     return all_tensors
@@ -97,13 +94,13 @@ def get_fmri_stats(sample : Dict[str, torch.Tensor]) -> Tuple[np.ndarray, np.nda
     roi_sum = tensor.sum(dim=(0,2)).numpy()        
     roi_sum_sq = (tensor**2).sum(dim=(0,2)).numpy() 
     n_points = tensor.shape[0]*tensor.shape[2]  # total number of time points across all samples                    
-    return (roi_sum, roi_sum_sq, n_points, sample['subj'])
+    return (roi_sum, roi_sum_sq, n_points, sample['subj']) # type: ignore
 
 
 def make_hcp_dataset_from_pt(path: str, include: str = '') -> FMRIDataset:
     fnames = sorted([os.path.join(path, fname) for fname in os.listdir(path) if (".pt" in fname and include in fname)])
-    fnames = fnames[:100]  # For testing, limit to first 100 files. Remove this line for full dataset.
-    b = db.from_sequence(fnames, npartitions=32).map(load_hcp_from_pt)
+    #fnames = fnames[:100]  # For testing, limit to first x files. Remove this line for full dataset.
+    b = db.from_sequence(fnames, npartitions=32).map(load_hcp_from_pt) # type: ignore
     stats = b.map(get_fmri_stats)
 
     def combine_stats(a,b):
@@ -111,15 +108,15 @@ def make_hcp_dataset_from_pt(path: str, include: str = '') -> FMRIDataset:
         
     initial_stats = (np.zeros((450,)), np.zeros((450,)), 0, np.array([]))
     total_sum, total_sum_sq, total_n, subjs = stats.fold(combine_stats, initial=initial_stats).compute()
-    print(f"total_sum shape: {total_sum.shape}, total_sum_sq shape: {total_sum_sq.shape}, total_n: {total_n}")
+    print(f"Number of samples: {subjs.shape}, unique subjects: {len(np.unique(subjs))}, avg samples per subject: {len(subjs)/len(np.unique(subjs))}") # type: ignore
     
-    mu = total_sum / total_n
-    sigma_sq = (total_sum_sq / total_n) - (mu ** 2)
+    mu = total_sum / total_n # type: ignore
+    sigma_sq = (total_sum_sq / total_n) - (mu ** 2) # type: ignore
     sigma = np.sqrt(sigma_sq)
     
     #d = b.map(lambda x: preprocess_samples(x, mu, sigma)).compute()
 
-    return FMRIDataset(fnames, mu, sigma), subjs
+    return FMRIDataset(fnames, mu, sigma), subjs # type: ignore
 
 
 def split_dataset(
@@ -132,12 +129,12 @@ def split_dataset(
     Deterministic split into train/val/test according to fractions.
     """
     assert 0 < train_frac < 1 and 0 < val_frac < 1 and train_frac + val_frac < 1
-    n = len(ds)
+    n = len(ds) # type: ignore
     n_train = int(round(train_frac * n))
     n_val = int(round(val_frac * n))
     n_test = n - n_train - n_val
     g = torch.Generator().manual_seed(seed)
-    return random_split(ds, [n_train, n_val, n_test], generator=g)
+    return random_split(ds, [n_train, n_val, n_test], generator=g) # type: ignore
 
 
 def make_dataloaders(
@@ -162,12 +159,35 @@ def make_dataloaders(
 # Optional: custom collate if your samples contain variable-length sequences.
 # For now, default PyTorch collate is fine for fixed-shape tensors.
 def identity_collate(batch):
-    return torch.utils.data._utils.collate.default_collate(batch)
+    return torch.utils.data._utils.collate.default_collate(batch) # type: ignore
+
+
+
+def load_hcp_age_gender(subjs):
+    """ Load HCP demographics file and return age and gender lists for each sample.
+    
+    Arguments:
+    ==========
+        subjs: list of subject IDs corresponding to the samples in the dataset (e.g. ['100307', '100408', ...])
+    
+    """
+    hcp_demographics = pd.read_csv(os.path.join(proj_dir, "data/HCP_demographic_data.csv"))
+    hcp_gender = []
+    hcp_age = []
+    for subj in subjs:
+        subj_row = hcp_demographics[hcp_demographics.Subject.astype(str)==subj]
+        if len(subj_row):
+            hcp_gender.append(subj_row.iloc[0]['Gender'])
+            hcp_age.append(subj_row.iloc[0]['Age'])
+        else:
+            print(f"HCP {subj} not in demographic file!?!")
+    return hcp_age, hcp_gender
+
 
 
 if __name__ == "__main__":
     # Example usage (adjust path and keys):
-    d = make_dataset_from_pt(os.path.join(proj_dir, 'data'))
+    d = make_hcp_dataset_from_pt(os.path.join(proj_dir, 'data/hcp'))
     train_loader, val_loader, test_loader = make_dataloaders(d, batch_size=16)
     for batch in train_loader:
         out = batch  # (fmri,) or (fmri, fc, G)

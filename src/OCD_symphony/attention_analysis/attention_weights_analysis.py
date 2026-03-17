@@ -5,7 +5,9 @@ import nilearn
 import nilearn.image
 import nilearn.plotting
 import numpy as np
+from numpy.typing import NDArray
 import os
+import pickle
 import scipy
 
 import OCD_symphony
@@ -24,16 +26,30 @@ def load_attn_scores():
     return attn_heads 
 
 
-def compute_weights_ttest(all_perceiver_attn:np.array, labels:np.array, head:int=0):
+def compute_weights_ttest(all_perceiver_attn:NDArray, labels:NDArray, head:int=0):
     """ Compute independent t-test for each brain regions' attention weight""" 
     hc_inds, = np.where(labels==0)
     ocd_inds, = np.where(labels==1)
 
     hc_attn = all_perceiver_attn[hc_inds, head, :, :].squeeze()
     ocd_attn = all_perceiver_attn[ocd_inds, head, :, :].squeeze()
-
+    
     # t-test using Welch method (not assuming equal variance)
-    res = scipy.stats.ttest_ind(hc_attn, ocd_attn, axis=0, permutations=500, equal_var=False)
+    #res = scipy.stats.ttest_ind(hc_attn, ocd_attn, axis=0, equal_var=False) # use permutation=100 if n_samples < 30
+    
+    # Parallelize across brain regions (axis=1 in the 2D attention matrix)
+    n_regions = hc_attn.shape[1]
+    results = Parallel(n_jobs=-1)(
+        delayed(scipy.stats.ttest_ind)(
+            hc_attn[:, i], ocd_attn[:, i],  equal_var=False
+        )
+        for i in range(n_regions)
+    )
+
+    # Stack results into the expected format
+    t_stats = np.array([r[0] for r in results])
+    p_vals = np.array([r[1] for r in results])
+    
     return res
 
 
@@ -60,13 +76,13 @@ def compute_significant_tstat(res, row, col):
 
 
 def plot_significant_tstat(sigt):
-    plt.figure(figsize=[4,4])
+    plt.figure(figsize=(4,4))
     plt.imshow(sigt, cmap='RdBu', vmin=-np.abs(sigt).max(), vmax=np.abs(sigt).max())
     plt.colorbar()
     plt.title("T stat (p<0.01)", fontsize=10)
 
 
-def create_attention_brain_image(sigvals:np.array, roi_inds:np.array) :
+def create_attention_brain_image(sigvals:NDArray, roi_inds:NDArray):
     """ Create a brain image from parcellated atlas with regions colorcoded by significance magnitude.
     
     Parameters
@@ -100,9 +116,9 @@ def create_attention_brain_image(sigvals:np.array, roi_inds:np.array) :
     node_ids = np.array(atlas_config['schaefer400_tianS3']['node_ids'])[reverse_roi_inds[inds]]
 
     # create attention brain img
-    attn_map = np.zeros(atlas.get_fdata().shape)
+    attn_map = np.zeros(atlas.get_fdata().shape) # type: ignore
     for i,node in enumerate(node_ids):
-        x,y,z = np.where(atlas.get_fdata()==node)
+        x,y,z = np.where(atlas.get_fdata()==node) # type: ignore
         attn_map[x,y,z] = metric[roi_inds[node-1]]
         print(f"Node index {node:4} \t {node_names[i]:30} \t : \t {metric[roi_inds[node-1]]:.2f} \t Metric index = {roi_inds[node-1]}")
 
@@ -114,7 +130,7 @@ def plot_attention_brain_image(attn_img):
     nilearn.plotting.plot_stat_map(attn_img, cmap='RdBu_r', cut_coords=[-44, 50, 4])
 
 
-def create_brain_image_from(vals:np.array, inds:np.array, roi_inds:np.array) :
+def create_brain_image_from(vals:NDArray, inds:NDArray, roi_inds:NDArray) :
     """ Create a brain image from parcellated atlas with regions colorcoded by significance magnitude.
     
     Parameters
@@ -148,9 +164,9 @@ def create_brain_image_from(vals:np.array, inds:np.array, roi_inds:np.array) :
     node_ids = np.array(atlas_config['schaefer400_tianS3']['node_ids'])[reverse_roi_inds[inds]]
 
     # create attention brain img
-    attn_map = np.zeros(atlas.get_fdata().shape)
+    attn_map = np.zeros(atlas.get_fdata().shape) # type: ignore
     for i,node in enumerate(node_ids):
-        x,y,z = np.where(atlas.get_fdata()==node)
+        x,y,z = np.where(atlas.get_fdata()==node) # type: ignore
         attn_map[x,y,z] = vals[i]
         #print(f"Node index {node:4} \t {node_names[i]:30} \t : \t {vals[roi_inds[node-1]]:.2f} \t Metric index = {roi_inds[node-1]}")
 
