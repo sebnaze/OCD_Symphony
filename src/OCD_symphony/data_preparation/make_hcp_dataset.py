@@ -1,4 +1,5 @@
 # Make OCD dataset from pre-saved patients' tensor files  
+import dask
 import dask.array as da
 import dask.bag as db
 import dask.dataframe as dd
@@ -17,15 +18,15 @@ class FMRIDataset(IterableDataset):
     """
     Iterable dataset that returns a tuple of available modalities: (fmri_data, fc_data, G_tensor) for each sample.
     """
-    def __init__(self, fnames, mu, sigma) -> None:
+    def __init__(self, fnames, W, B) -> None:
         self.fnames = fnames
-        self.mu = torch.from_numpy(mu).float()
-        self.sigma = torch.from_numpy(sigma).float()
+        self.W = torch.from_numpy(W).float()
+        self.B = torch.from_numpy(B).float()
 
     def __iter__(self):
         for fname in self.fnames:
             samples = load_hcp_from_pt(fname)
-            samples = preprocess_samples(samples, self.mu, self.sigma)
+            samples = preprocess_samples(samples, self.W, self.B)
             for i in range(samples['fmri_data'].shape[0]):
                 yield (samples['fmri_data'][i], samples['fc_data'][i], samples['G_tensor'][i])
     
@@ -60,11 +61,11 @@ def load_hcp_from_pt(fpath: str) -> Dict[str, torch.Tensor]:
     return all_tensors
 
 
-def preprocess_samples(samples: Dict[str, torch.Tensor], mu, sigma) -> Dict[str, torch.Tensor]:
+def preprocess_samples(samples: Dict[str, torch.Tensor], W, B) -> Dict[str, torch.Tensor]:
     """
     Preprocess samples (e.g. reshape, re-index, normalize).
     """
-    # reshape to (n_samples, n_rois, n_timesteps) and (n_samples, n_rois, n_timesteps)
+    # reshape to (n_samples, n_rois, n_timesteps) and (n_samples, n_rois, n_n_rois) and (n_samples, n_rois, n_Gradients)
     samples['fmri_data'] = samples['fmri_data'].reshape(-1,450,200)
     samples['fc_data'] = samples['fc_data'].reshape(-1,450,450)
     samples['G_tensor'] = torch.randn(samples['fmri_data'].shape[0], 450, 10)
@@ -74,14 +75,10 @@ def preprocess_samples(samples: Dict[str, torch.Tensor], mu, sigma) -> Dict[str,
     samples['fmri_data'] = samples['fmri_data'][:,roi_inds,:]
     samples['fc_data'] = samples['fc_data'][:,roi_inds,:][:,:,roi_inds]
 
-    # normalize fMRI timeseries ROI-wise
-    for i in np.arange(samples['fmri_data'].shape[1]):
-        m = samples['fmri_data'][:,i,:].median()
-        iqr = scipy.stats.iqr(samples['fmri_data'][:,i,:])
-        samples['fmri_data'][:,i,:] = (samples['fmri_data'][:,i,:] - m) / (iqr + 1e-8)
-
-    # z-score fMRI timeseries across entire dataset
-    samples['fmri_data'] = (samples['fmri_data'] - mu[np.newaxis, :, np.newaxis]) / (sigma[np.newaxis, :, np.newaxis] + 1e-8)
+    # fmri_data shape: (n_samples, 450, 200)
+    # W and B shape: (450,)
+    # We unsqueeze W and B to align with the ROI dimension (dim 1)
+    samples['fmri_data'] = samples['fmri_data'] * W.reshape(1, -1, 1) + B.reshape(1, -1, 1)
     return samples
 
 
@@ -93,30 +90,97 @@ def get_fmri_stats(sample : Dict[str, torch.Tensor]) -> Tuple[np.ndarray, np.nda
     # Sum along the time axis (dim -1)
     roi_sum = tensor.sum(dim=(0,2)).numpy()        
     roi_sum_sq = (tensor**2).sum(dim=(0,2)).numpy() 
-    n_points = tensor.shape[0]*tensor.shape[2]  # total number of time points across all samples                    
+    n_points = tensor.shape[0]*tensor.shape[2]  # total number of time points per ROI across all samples                    
     return (roi_sum, roi_sum_sq, n_points, sample['subj']) # type: ignore
 
 
-def make_hcp_dataset_from_pt(path: str, include: str = '') -> FMRIDataset:
+
+def get_fmri_raw_points(sample: Dict[str, torch.Tensor]):
+    tensor = sample['fmri_data'] # (n_samples, 450, 200)
+    if tensor.shape[1] != 450 or tensor.shape[2] != 200:
+        return []
+    
+    # Reshape to (450, n_samples * 200) and transpose 
+    # so each row in our future dataframe is one timepoint for all 450 ROIs
+    flattened = tensor.permute(0, 2, 1).reshape(-1, 450).numpy()
+    return (flattened, sample['subj']) # type: ignore
+
+
+def get_fmri_subjs(sample: Dict[str, torch.Tensor]):
+    return sample['subj'] # type: ignore
+
+def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None) -> FMRIDataset:
     fnames = sorted([os.path.join(path, fname) for fname in os.listdir(path) if (".pt" in fname and include in fname)])
-    #fnames = fnames[:100]  # For testing, limit to first x files. Remove this line for full dataset.
+    
+    if n_subjs is not None:
+        fnames = fnames[:n_subjs] # For testing, limit to first x files.
+    
     b = db.from_sequence(fnames, npartitions=32).map(load_hcp_from_pt) # type: ignore
-    stats = b.map(get_fmri_stats)
-
-    def combine_stats(a,b):
-        return (a[0] + b[0], a[1] + b[1], a[2] + b[2], np.concatenate([a[3], b[3]]))
+    
+    #--------------------------------------------#
+    #       OLD APPROACH: Mean and STD           #
+    #--------------------------------------------#
+    #stats = b.map(get_fmri_stats)
+    #def combine_stats(a,b):
+    #    return (a[0] + b[0], a[1] + b[1], a[2] + b[2], np.concatenate([a[3], b[3]]))
         
-    initial_stats = (np.zeros((450,)), np.zeros((450,)), 0, np.array([]))
-    total_sum, total_sum_sq, total_n, subjs = stats.fold(combine_stats, initial=initial_stats).compute()
-    print(f"Number of samples: {subjs.shape}, unique subjects: {len(np.unique(subjs))}, avg samples per subject: {len(subjs)/len(np.unique(subjs))}") # type: ignore
+    #initial_stats = (np.zeros((450,)), np.zeros((450,)), 0, np.array([]))
+    #total_sum, total_sum_sq, total_n, subjs = stats.fold(combine_stats, initial=initial_stats).compute()
+    #print(f"Number of samples: {subjs.shape}, unique subjects: {len(np.unique(subjs))}, avg samples per subject: {len(subjs)/len(np.unique(subjs))}") # type: ignore
     
-    mu = total_sum / total_n # type: ignore
-    sigma_sq = (total_sum_sq / total_n) - (mu ** 2) # type: ignore
-    sigma = np.sqrt(sigma_sq)
+    #mu = total_sum / total_n # type: ignore
+    #sigma_sq = (total_sum_sq / total_n) - (mu ** 2) # type: ignore
+    #sigma = np.sqrt(sigma_sq)
     
-    #d = b.map(lambda x: preprocess_samples(x, mu, sigma)).compute()
 
-    return FMRIDataset(fnames, mu, sigma), subjs # type: ignore
+    #--------------------------------------------#
+    #  NEW APPROACH: Mean, Std, Median and IQR   #
+    #--------------------------------------------#
+        
+    # 1. Convert to Dask DataFrame (keeping your existing setup)
+    raw_data = b.map(get_fmri_raw_points)
+    fmri_bag = raw_data.map(lambda x: x[0])
+    ddf = fmri_bag.flatten().to_dataframe(columns=[f'roi_{i}' for i in range(450)])
+
+    # 2. Extract subjects (this is a separate Bag operation, but we can compute it together)
+    subjs_bag = raw_data.map(lambda x: x[1])
+    
+    # Subjs reduction
+    #subjs_lazy = subjs_bag.fold(np.concatenate, initial=np.array([]))
+    subjs_lazy = subjs_bag.flatten().to_dataframe(columns=['subj'])
+    
+    
+    # 3. Define all required aggregations lazily
+    # Quantiles for Robust Scaling
+    q_lazy = ddf.quantile([0.25, 0.5, 0.75])
+
+    # 4. TRICK: To get Mean/Std of the Robust data in the same pass, 
+    # we calculate Mean/Std of the RAW data and transform them algebraically.
+    mean_lazy = ddf.mean()
+    std_lazy = ddf.std()
+
+    # 5. Execute everything in ONE pass
+    q, subjs, raw_mu, raw_std = dask.compute(q_lazy, subjs_lazy, mean_lazy, std_lazy)
+    subjs = np.array(subjs).squeeze() # type: ignore
+
+    # 6. Extract constants from results
+    median = q.loc[0.5].values
+    iqr = (q.loc[0.75] - q.loc[0.25]).values
+    iqr = np.where(iqr == 0, 1e-8, iqr)
+
+    # 7. Algebraic Shift: 
+    # Instead of a second pass for 'mu_robust', calculate what they would be:
+    # If x_robust = (x - median) / iqr, then:
+    mu_robust = (raw_mu.values - median) / iqr
+    sigma_robust = raw_std.values / iqr
+    sigma_robust = np.where(sigma_robust == 0, 1e-8, sigma_robust)
+
+    # 8. Collapse constants for the linear transform: x_final = x*W + B
+    denom = iqr * sigma_robust
+    W = 1.0 / denom
+    B = (-median / denom) - (mu_robust / sigma_robust)
+
+    return FMRIDataset(fnames, W, B), subjs # type: ignore
 
 
 def split_dataset(

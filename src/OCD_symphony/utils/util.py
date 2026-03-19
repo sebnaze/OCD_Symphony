@@ -3,10 +3,18 @@
 import argparse
 from concurrent_log_handler import ConcurrentRotatingFileHandler
 from datetime import datetime
+import json
 import logging
+import nilearn.image
+import numpy as np
 import os
 import platform
 import sys
+
+#----------------------------------------------------
+#                General utilities
+#----------------------------------------------------
+
 
 def today():
     return datetime.now().strftime('_%Y%m%d')
@@ -60,3 +68,24 @@ proj_dir = os.path.join(get_working_dir(), 'lab_lucac/sebastiN/projects/OCD_Symp
 # when config file is given, this gets overwritten
 cfg = argparse.Namespace()
 cfg.proj_dir = proj_dir
+
+
+
+#-----------------------------------------------------------------------------------
+#                           Brain Symphony utilities
+#-----------------------------------------------------------------------------------
+
+def get_BrainSymphony_atlas_labels():
+    """ Load atlas id and labels for Brain Symphony's Schaefer400_TianS3 """
+    # load atlas img and id/labels pairs
+    with open(os.path.join(proj_dir, 'parcellations', 'atlas_config.json'), 'r') as f:
+        atlas_config = json.load(f)
+
+    # re-org ROI indices from Schaefer to Brain Symphony: ctx_L, sub-ctx_L, ctx_R, sub-ctx_R --> sub-ctx_R, sub-ctx_L, ctx_L, ctx_R 
+    roi_inds = np.concatenate([np.arange(425,450), np.arange(200,225), np.arange(0,200), np.arange(225, 425)])
+
+    # get significant regions names and ids from Brain Symph to Schaefer    
+    node_names = np.array(atlas_config['schaefer400_tianS3']['node_names'])[roi_inds]
+    node_ids = np.array(atlas_config['schaefer400_tianS3']['node_ids'])[roi_inds]
+
+    return node_ids, node_names
