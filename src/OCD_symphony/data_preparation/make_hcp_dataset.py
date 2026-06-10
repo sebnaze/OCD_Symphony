@@ -20,18 +20,67 @@ class FMRIDataset(IterableDataset):
     """
     def __init__(self, fnames, W, B) -> None:
         self.fnames = fnames
+        # W and B are the constants for the linear transform to apply to fmri_data for robust scaling: x_final = x*W + B
+        # where W = 1.0 / (iqr * sigma_robust) and B = (-median / (iqr * sigma_robust)) - (mu_robust / sigma_robust)
+        # i.e. we are collapsing the robust scaling and standardization into one linear transform to avoid multiple passes through the data.
         self.W = torch.from_numpy(W).float()
         self.B = torch.from_numpy(B).float()
+    
+    def __len__(self):
+        return len(self.fnames)
 
     def __iter__(self):
         for fname in self.fnames:
+            # load samples
             samples = load_hcp_from_pt(fname)
+            # preprocess samples (reshape, re-index, normalize)
             samples = preprocess_samples(samples, self.W, self.B)
             for i in range(samples['fmri_data'].shape[0]):
                 yield (samples['fmri_data'][i], samples['fc_data'][i], samples['G_tensor'][i])
     
 
-def load_hcp_from_pt(fpath: str) -> Dict[str, torch.Tensor]:
+class FMRIDataset(Dataset):
+    """
+    Map dataset that returns a tuple of available modalities and labels: (fmri_data, fc_data, G_tensor, age, gender) for each sample.
+    """
+    def __init__(self, fnames, subjs, W, B) -> None:
+        self.fnames = fnames
+        self.subjs = subjs
+
+        # create index map to allow deterministic access to samples across files. 
+        self.index_map = []
+        for fname in fnames:
+            subj = os.path.basename(fname)[:-3]
+            n_samples = len(np.where(self.subjs==subj)[0]) # type: ignore
+            for i in range(n_samples):
+                self.index_map.append((fname, i))
+        
+
+        # W and B are the constants for the linear transform to apply to fmri_data for robust scaling: x_final = x*W + B
+        # where W = 1.0 / (iqr * sigma_robust) and B = (-median / (iqr * sigma_robust)) - (mu_robust / sigma_robust)
+        # i.e. we are collapsing the robust scaling and standardization into one linear transform to avoid multiple passes through the data.
+        self.W = torch.from_numpy(W).float()
+        self.B = torch.from_numpy(B).float()
+    
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        # This is safely called by the DataLoader when shuffle=True
+        fname, sample_idx = self.index_map[idx]
+        
+        # Load just this specific file (or cache it to prevent repeated disk reads)
+        samples = load_hcp_from_pt(fname)
+        samples = preprocess_samples(samples, self.W, self.B)
+
+        return (samples['fmri_data'][sample_idx], 
+                samples['fc_data'][sample_idx], 
+                samples['G_tensor'][sample_idx],
+                samples['subj'][sample_idx],
+                samples['age'][sample_idx],
+                samples['gender'][sample_idx])    
+
+def load_hcp_from_pt(fpath: str) -> Dict:
     """
     Load dictionnary files for each subject and combine them
     """
@@ -39,25 +88,30 @@ def load_hcp_from_pt(fpath: str) -> Dict[str, torch.Tensor]:
     tnsr = torch.load(fpath, map_location='cpu', weights_only=True)
 
     all_tensors = {key:torch.Tensor() for key in tnsr.keys()}
-    all_tensors['subj'] = [] # type: ignore
+    #all_tensors['subj'] = [] # type: ignore
     
     # ad-hoc extraction of subject id from file name
     subj = os.path.basename(fpath)[:-3] 
     n_samples = tnsr['fmri_data'].shape[0]*tnsr['fmri_data'].shape[1]    
-    all_tensors['subj'].append(np.repeat(subj, n_samples))        
+    #all_tensors['subj'].append(np.repeat(subj, n_samples))        
             
-    # reshaping first dim of data to n_samples
+    # reshaping first dim of data to n_samples in fMRI and dMRI data
     for key in tnsr.keys():  # fmri_data, fc_data, session
         if key in ['fmri_data', 'fc_data', 'G_tensor']:
             shp = tnsr[key].shape
             all_tensors[key] = torch.cat([all_tensors[key], tnsr[key].reshape(-1,shp[-2], shp[-1])], dim=0)
 
-    
-    for key in all_tensors.keys():
-        if type(all_tensors[key])!=torch.Tensor:
-            all_tensors[key] = np.array(all_tensors[key]).reshape(-1,) # type: ignore
-        #print(f"all_tensors[{key}].shape : \t{all_tensors[key].shape}")
+    # Use numpy array 
+    # convert lists to vector for non-tensor data (e.g. subject ids) 
+    #for key in all_tensors.keys():
+    #    if type(all_tensors[key])!=torch.Tensor:
+    #        all_tensors[key] = np.array(all_tensors[key]).reshape(-1,) # type: ignore
 
+    # handle the demographic data (age and gender) -- use numpy arrays for easier handling with dask
+    age, gender = load_hcp_age_gender([subj])
+    all_tensors['subj'] = np.repeat(subj, n_samples) # type: ignore
+    all_tensors['age'] = np.repeat(age[0], n_samples) # type: ignore
+    all_tensors['gender'] = np.repeat(gender[0], n_samples) # type: ignore
     return all_tensors
 
 
@@ -109,11 +163,11 @@ def get_fmri_raw_points(sample: Dict[str, torch.Tensor]):
 def get_fmri_subjs(sample: Dict[str, torch.Tensor]):
     return sample['subj'] # type: ignore
 
-def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None) -> FMRIDataset:
+def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None, start_idx=0) -> FMRIDataset:
     fnames = sorted([os.path.join(path, fname) for fname in os.listdir(path) if (".pt" in fname and include in fname)])
     
     if n_subjs is not None:
-        fnames = fnames[:n_subjs] # For testing, limit to first x files.
+        fnames = fnames[start_idx:start_idx+n_subjs] # take slice of dataset
     
     b = db.from_sequence(fnames, npartitions=32).map(load_hcp_from_pt) # type: ignore
     
@@ -137,7 +191,7 @@ def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None) -> FMRI
     #  NEW APPROACH: Mean, Std, Median and IQR   #
     #--------------------------------------------#
         
-    # 1. Convert to Dask DataFrame (keeping your existing setup)
+    # 1. Convert to Dask DataFrame (keeping existing setup)
     raw_data = b.map(get_fmri_raw_points)
     fmri_bag = raw_data.map(lambda x: x[0])
     ddf = fmri_bag.flatten().to_dataframe(columns=[f'roi_{i}' for i in range(450)])
@@ -180,7 +234,7 @@ def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None) -> FMRI
     W = 1.0 / denom
     B = (-median / denom) - (mu_robust / sigma_robust)
 
-    return FMRIDataset(fnames, W, B), subjs # type: ignore
+    return FMRIDataset(fnames, subjs, W, B), subjs # type: ignore
 
 
 def split_dataset(
@@ -191,6 +245,7 @@ def split_dataset(
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Deterministic split into train/val/test according to fractions.
+    IT DOES NOT HANDLE LEAVE-SUBJ-OUT SPLITS, so the validation and test sets may contain samples from the same subjects as the training set.
     """
     assert 0 < train_frac < 1 and 0 < val_frac < 1 and train_frac + val_frac < 1
     n = len(ds) # type: ignore
@@ -209,7 +264,8 @@ def make_dataloaders(
     shuffle_train: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create DataLoader objects for train, validation and test sets
+    Create DataLoader objects for train, validation and test sets, just for debug purpose. 
+    IT DOES NOT HANDLE LEAVE-SUBJ-OUT SPLITS, so the validation and test sets may contain samples from the same subjects as the training set.
     """ 
     train_ds, val_ds, test_ds = split_dataset(ds)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle_train,
@@ -251,11 +307,11 @@ def load_hcp_age_gender(subjs):
 
 if __name__ == "__main__":
     # Example usage (adjust path and keys):
-    d = make_hcp_dataset_from_pt(os.path.join(proj_dir, 'data/hcp'))
-    train_loader, val_loader, test_loader = make_dataloaders(d, batch_size=16)
+    dataset, subjs = make_hcp_dataset_from_pt(os.path.join(proj_dir, 'data/hcp'), n_subjs=10)
+    train_loader, val_loader, test_loader = make_dataloaders(dataset, batch_size=16)
     for batch in train_loader:
-        out = batch  # (fmri,) or (fmri, fc, G)
-        print(f"Length = {len(out)}")
-        print(f"shapes = {[o.shape for o in out]}")
+        fmri, fc, G, subj, age, gender = batch 
+        print(f"fmri shape: {fmri.shape}, fc shape: {fc.shape}, G shape: {G.shape}")
+        print(f"subj: {subj}, age: {age}, gender: {gender}") 
         break
     pass

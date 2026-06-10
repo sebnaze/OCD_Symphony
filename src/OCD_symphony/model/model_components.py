@@ -15,9 +15,6 @@ from brainspace.gradient import GradientMaps
 # Build gradients using diffusion maps and normalized angle
 gm = GradientMaps(n_components=30, approach='dm', kernel='normalized_angle')
 
-
-
-
 # Check if GPU is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,8 +63,6 @@ class RelativePositionalEncoding(nn.Module):
 ##########################
 # 2. Learnable Positional Encoding #
 #########################
-
-
 
 class LearnablePosEncoding(nn.Module):
     def __init__(self, dim, max_len=5000):

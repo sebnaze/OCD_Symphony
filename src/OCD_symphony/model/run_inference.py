@@ -12,13 +12,25 @@ from OCD_symphony.model.model_components import *
 
 
 def run_inference(dataset, output_file, n_samples):
-    BATCH_SIZE = 16
+    """
+    Run inference on the pretrained models and save the reconstructions, attention maps, and embeddings for each subject.
+    The output will be saved as memory-mapped numpy arrays to efficiently handle large datasets without consuming too much RAM. 
+    Each array will have shape (n_samples, ...), where n_samples is the number of subjects in the dataset, 
+    and the remaining dimensions depend on the specific output (e.g., reconstructions, attention maps, embeddings).
 
-    #dataset = FMRIDataset(fmri_data, fc_data, G_tensor)
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle = False)
+    Args:
+        dataset: A PyTorch Dataset object containing the fMRI data and any additional modalities required by the models.
+        output_file: The base file name (without extension) for saving the output numpy arrays. 
+                     The function will create multiple files with suffixes indicating the type of output (e.g., recon_temp, recon_spat, temporal_attn_first, etc.).
+        n_samples: The total number of samples (subjects) in the dataset. This is used to pre-allocate the memory-mapped arrays with the correct shape.
+    
+    Returns:
+        A dictionary containing the memory-mapped numpy arrays for each type of output. 
+        The keys will indicate the type of output (e.g., 'all_recon_temp', 'all_recon_spat', etc.)
+    """
 
     # === Load pretrained models ===
-
+    BATCH_SIZE = 16
     DIM = 128
     NUM_LAYERS = 6
     NUM_HEADS = 4
@@ -31,8 +43,9 @@ def run_inference(dataset, output_file, n_samples):
     DELTA = 0.5
     LEARNING_RATE = 1e-4
     ROIs = 450
-
-
+    
+    #dataset = FMRIDataset(fmri_data, fc_data, G_tensor)
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle = False)
 
     base_transformer = TemporalTransformer(NUM_LAYERS, DIM, NUM_HEADS, MLP_DIM, TIME_STEPS, MAX_LEN_TEMP, ROIs).to(device)
     masker = TokenMasker1D(mask_ratio=0)
