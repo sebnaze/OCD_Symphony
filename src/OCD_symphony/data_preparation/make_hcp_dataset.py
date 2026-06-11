@@ -10,6 +10,7 @@ from OCD_symphony.utils import proj_dir
 import os
 import pandas as pd
 import scipy
+from sklearn.preprocessing import LabelEncoder
 import torch
 from torch.utils.data import Dataset, IterableDataset, DataLoader, random_split
 from typing import Optional, Dict, Tuple
@@ -43,9 +44,10 @@ class FMRIDataset(Dataset):
     """
     Map dataset that returns a tuple of available modalities and labels: (fmri_data, fc_data, G_tensor, age, gender) for each sample.
     """
-    def __init__(self, fnames, subjs, W, B) -> None:
+    def __init__(self, fnames, subjs, label, W, B) -> None:
         self.fnames = fnames
         self.subjs = subjs
+        self.label = label
 
         # create index map to allow deterministic access to samples across files. 
         self.index_map = []
@@ -61,7 +63,16 @@ class FMRIDataset(Dataset):
         # i.e. we are collapsing the robust scaling and standardization into one linear transform to avoid multiple passes through the data.
         self.W = torch.from_numpy(W).float()
         self.B = torch.from_numpy(B).float()
-    
+
+        # Create numeric labels from string labels
+        ages, genders = load_hcp_age_gender(self.subjs)
+        self.label_encoder = LabelEncoder()
+        if label == 'age':
+            self.label_encoder.fit(ages)
+
+        if label == 'gender':
+            self.label_encoder.fit(genders)
+
     def __len__(self):
         return len(self.index_map)
 
@@ -76,9 +87,8 @@ class FMRIDataset(Dataset):
         return (samples['fmri_data'][sample_idx], 
                 samples['fc_data'][sample_idx], 
                 samples['G_tensor'][sample_idx],
-                samples['subj'][sample_idx],
-                samples['age'][sample_idx],
-                samples['gender'][sample_idx])    
+                self.label_encoder.transform([samples[self.label][sample_idx]]).squeeze()) # type: ignore 
+
 
 def load_hcp_from_pt(fpath: str) -> Dict:
     """
@@ -148,7 +158,6 @@ def get_fmri_stats(sample : Dict[str, torch.Tensor]) -> Tuple[np.ndarray, np.nda
     return (roi_sum, roi_sum_sq, n_points, sample['subj']) # type: ignore
 
 
-
 def get_fmri_raw_points(sample: Dict[str, torch.Tensor]):
     tensor = sample['fmri_data'] # (n_samples, 450, 200)
     if tensor.shape[1] != 450 or tensor.shape[2] != 200:
@@ -163,7 +172,8 @@ def get_fmri_raw_points(sample: Dict[str, torch.Tensor]):
 def get_fmri_subjs(sample: Dict[str, torch.Tensor]):
     return sample['subj'] # type: ignore
 
-def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None, start_idx=0) -> FMRIDataset:
+
+def make_hcp_dataset_from_pt(path: str, label: str, include: str = '', n_subjs=None, start_idx=0) -> FMRIDataset:
     fnames = sorted([os.path.join(path, fname) for fname in os.listdir(path) if (".pt" in fname and include in fname)])
     
     if n_subjs is not None:
@@ -234,7 +244,7 @@ def make_hcp_dataset_from_pt(path: str, include: str = '', n_subjs=None, start_i
     W = 1.0 / denom
     B = (-median / denom) - (mu_robust / sigma_robust)
 
-    return FMRIDataset(fnames, subjs, W, B), subjs # type: ignore
+    return FMRIDataset(fnames, subjs, label, W, B), subjs # type: ignore
 
 
 def split_dataset(
