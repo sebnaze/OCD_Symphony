@@ -65,6 +65,9 @@ def create_log(logname):
 working_dir = get_working_dir()
 proj_dir = os.path.join(get_working_dir(), 'lab_lucac/sebastiN/projects/OCD_Symphony')
 
+if platform.node()=='NEUROv02':
+    proj_dir = '/home/sebastin/projects/OCD_Symphony'
+
 # when config file is given, this gets overwritten
 cfg = argparse.Namespace()
 cfg.proj_dir = proj_dir
