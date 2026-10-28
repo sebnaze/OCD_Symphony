@@ -31,6 +31,27 @@ from OCD_symphony.utils import proj_dir
 # ---------------------------------------------------------------------------
 # File-level loader (runs in threads – keep it side-effect-free)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Demographics helper
+# ---------------------------------------------------------------------------
+
+def load_hcp_age_gender(subjs):
+    """Return (ages, genders) lists aligned with `subjs`."""
+    hcp_demographics = pd.read_csv(
+        os.path.join(proj_dir, "data/HCP_demographic_data.csv")
+    )
+    hcp_gender, hcp_age = [], []
+    for subj in subjs:
+        row = hcp_demographics[hcp_demographics.Subject.astype(str) == subj]
+        if len(row):
+            hcp_gender.append(row.iloc[0]["Gender"])
+            hcp_age.append(row.iloc[0]["Age"])
+        else:
+            print(f"HCP {subj} not found in demographic file.")
+    return hcp_age, hcp_gender
+
+
+
 
 def _load_raw_file(fname: str) -> Optional[Dict]:
     """
@@ -572,26 +593,6 @@ def cv_dataloaders(
             _make_loader(train_sub, shuffle=shuffle_train, **kw),
             _make_loader(val_sub,   shuffle=False,         **kw),
         )
-
-
-# ---------------------------------------------------------------------------
-# Demographics helper
-# ---------------------------------------------------------------------------
-
-def load_hcp_age_gender(subjs):
-    """Return (ages, genders) lists aligned with `subjs`."""
-    hcp_demographics = pd.read_csv(
-        os.path.join(proj_dir, "data/HCP_demographic_data.csv")
-    )
-    hcp_gender, hcp_age = [], []
-    for subj in subjs:
-        row = hcp_demographics[hcp_demographics.Subject.astype(str) == subj]
-        if len(row):
-            hcp_gender.append(row.iloc[0]["Gender"])
-            hcp_age.append(row.iloc[0]["Age"])
-        else:
-            print(f"HCP {subj} not found in demographic file.")
-    return hcp_age, hcp_gender
 
 
 # ---------------------------------------------------------------------------

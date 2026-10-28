@@ -7,6 +7,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
+import numpy as np
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import f1_score
 from time import time
 import wandb
@@ -78,7 +80,14 @@ TIME_STEPS = 200
 ROIs = 450
 
 
-def finetune(trainset, valset, testset, args, local_rank=0):
+def clean_gpu_memory():
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None):
     """
     Fine-tune the pretrained Perceiver classifier on the HCP dataset for gender classification.
     Uses Leave-Subject-Out cross-validation splits.
@@ -207,6 +216,10 @@ def finetune(trainset, valset, testset, args, local_rank=0):
             ), map_location=device,
         )
     )
+    # Freeze the perceiver backbone; only train reduction and classification heads
+    for param in perceiver.parameters():
+        param.requires_grad = False
+
     classifier = PerceiverClassifier(perceiver, latent_dim=DIM, num_classes=2).to(device)
 
     # ── Wrap in DDP when distributed ────────────────────────────────────────
@@ -214,18 +227,38 @@ def finetune(trainset, valset, testset, args, local_rank=0):
         classifier = DDP(classifier, device_ids=[local_rank], find_unused_parameters=False)
 
     # ── Optimizer and Loss ──────────────────────────────────────────────────
+    trainable_params = [p for p in classifier.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        classifier.parameters(), lr=args.learning_rate, weight_decay=1e-2
+        trainable_params, lr=args.learning_rate, weight_decay=1e-2
     )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         int(0.1 * args.n_epochs * len(train_loader)),
         args.n_epochs * len(train_loader),
     )
-    criterion = nn.CrossEntropyLoss()
+
+    # Inverse-frequency class weights to penalize collapsing into majority class
+    if isinstance(trainset, Subset):
+        train_labels_tensor = trainset.dataset.encoded_labels[trainset.indices]
+    else:
+        train_labels_tensor = trainset.encoded_labels
+
+    class_counts = torch.bincount(train_labels_tensor)
+    class_weights = (len(train_labels_tensor) / (len(class_counts) * class_counts.float())).to(device)
+    if is_main:
+        print(f"[Class Balance] counts: {class_counts.tolist()} | weights: {[round(w, 4) for w in class_weights.tolist()]}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # ── Training Loop ───────────────────────────────────────────────────────
     best_val_acc = 0.0
+    history = {
+        "train_loss": [],
+        "train_acc": [],
+        "train_f1": [],
+        "val_acc": [],
+        "val_f1": [],
+    }
     t0 = time()
     for epoch in range(args.n_epochs):
         t1 = time()
@@ -251,7 +284,8 @@ def finetune(trainset, valset, testset, args, local_rank=0):
                 _, signal_context = conv_model(fmri, mask=None)
 
             logits, recon = classifier(roi_embeds, time_embeds, signal_context, roi_pos)
-            loss = criterion(logits, labels) + F.mse_loss(recon, fmri)
+            recon_weight = getattr(args, "recon_weight", 1e-4)
+            loss = criterion(logits, labels) + recon_weight * F.mse_loss(recon, fmri)
 
             optimizer.zero_grad()
             loss.backward()
@@ -355,13 +389,36 @@ def finetune(trainset, valset, testset, args, local_rank=0):
                 model_state = (
                     classifier.module.state_dict() if args.ddp else classifier.state_dict()
                 )
-                torch.save(
-                    model_state,
-                    os.path.join(
-                        proj_dir, 'models',
-                        f"Fine_tuned_perceiver_classifier_gender_HCP_YA_nL{NUM_LAYERS}_d{DIM}_h{NUM_HEADS}_mlp{MLP_DIM}.pth"
-                    ),
-                )
+                label_str = getattr(args, 'label', 'gender')
+                wandb_hash = None
+                if args.use_wandb and wandb.run is not None:
+                    wandb_hash = getattr(wandb.run, 'id', None)
+
+                if wandb_hash:
+                    save_filename = f"Fine_tuned_perceiver_classifier_HCP_YA_{wandb_hash}_nL{NUM_LAYERS}_d{DIM}_h{NUM_HEADS}_mlp{MLP_DIM}_{label_str}.pth"
+                else:
+                    save_filename = f"Fine_tuned_perceiver_classifier_HCP_YA_nL{NUM_LAYERS}_d{DIM}_h{NUM_HEADS}_mlp{MLP_DIM}_{label_str}.pth"
+
+                save_path = os.path.join(proj_dir, 'models', save_filename)
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(model_state, save_path)
+
+        train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0.0
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_f1'].append(train_f1)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+
+        if epoch_callback is not None and is_main:
+            epoch_callback(epoch + 1, {
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'train_f1': train_f1,
+                'val_acc': val_acc,
+                'val_f1': val_f1,
+            })
 
     # ── Final evaluation on held-out test set ───────────────────────────────
     classifier.eval()
@@ -417,7 +474,240 @@ def finetune(trainset, valset, testset, args, local_rank=0):
         if args.use_wandb:
             wandb.log({"test_acc": test_acc, "test_f1": test_f1})
 
-    return test_acc, test_f1
+    return test_acc, test_f1, history
+
+
+def run_single_split(args, local_rank=0, epoch_callback=None):
+    """Single deterministic train/val/test split using subject_train_val_test_split."""
+    is_main = is_main_process()
+    t0 = time()
+
+    dataset, subjs = make_hcp_dataset_from_pt(
+        path=os.path.join(proj_dir, "data/hcp"),
+        label=args.label,
+        n_subjs=args.n_subjs,
+    )
+    if is_main:
+        print(
+            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
+            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
+        )
+
+    trainset, valset, testset = subject_train_val_test_split(
+        dataset, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed,
+    )
+
+    if args.use_wandb and is_main:
+        wandb.init(
+            project="OCD_Symphony",
+            name=f"Finetuning_HCP_{args.label}_single",
+            config=vars(args) if hasattr(args, "__dict__") else None,
+        )
+
+    test_acc, test_f1, history = finetune(trainset, valset, testset, args, local_rank=local_rank, epoch_callback=epoch_callback)
+
+    if args.use_wandb and is_main:
+        wandb.finish()
+
+    return test_acc, test_f1, history
+
+
+def split_fold_data(dataset, trainset, testset, fold_idx, args):
+    """
+    Split a cross-validation fold trainset into train and validation sets
+    using subject-level StratifiedGroupKFold without data leakage.
+    """
+    ds = dataset
+    train_sample_indices = list(trainset.indices)
+    train_subjs = ds.subjs[train_sample_indices]
+
+    unique_train_subjs = np.unique(train_subjs)
+    train_labels_subj = []
+    for s in unique_train_subjs:
+        mask = train_subjs == s
+        lbls = ds.encoded_labels.numpy()[train_sample_indices][mask]
+        counts = np.bincount(lbls)
+        train_labels_subj.append(np.argmax(counts))
+    train_labels_subj = np.array(train_labels_subj)
+
+    n_inner = max(2, round(1.0 / args.val_frac))
+    inner_sgkf = StratifiedGroupKFold(
+        n_splits=n_inner, shuffle=True, random_state=args.seed + fold_idx
+    )
+    inner_splits = list(
+        inner_sgkf.split(unique_train_subjs, train_labels_subj, groups=unique_train_subjs)
+    )
+    _, val_subj_idx = inner_splits[-1]
+    train_subj_idx = np.setdiff1d(
+        np.arange(len(unique_train_subjs)), val_subj_idx
+    )
+
+    val_subjs = unique_train_subjs[val_subj_idx]
+    new_train_subjs = unique_train_subjs[train_subj_idx]
+
+    for s in val_subjs:
+        assert s not in new_train_subjs, f"Subject leakage detected: {s}"
+
+    val_sample_indices = np.where(np.isin(ds.subjs, val_subjs))[0].tolist()
+    new_train_sample_indices = np.where(np.isin(ds.subjs, new_train_subjs))[0].tolist()
+
+    new_trainset = Subset(ds, new_train_sample_indices)
+    valset = Subset(ds, val_sample_indices)
+
+    return new_trainset, valset, testset
+
+
+def run_single_fold(args, local_rank=0, epoch_callback=None):
+    """Run fine-tuning for a single specified CV fold."""
+    is_main = is_main_process()
+    t0 = time()
+
+    if args.fold_idx < 0 or args.fold_idx >= args.n_folds:
+        raise ValueError(
+            f"--fold_idx must be between 0 and {args.n_folds - 1}, got {args.fold_idx}"
+        )
+
+    dataset, subjs = make_hcp_dataset_from_pt(
+        path=os.path.join(proj_dir, "data/hcp"),
+        label=args.label,
+        n_subjs=args.n_subjs,
+    )
+    if is_main:
+        print(
+            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
+            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
+        )
+
+    folds = list(subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed))
+    trainset, testset = folds[args.fold_idx]
+
+    if is_main:
+        print("\n" + "=" * 60)
+        print(f"  Running Fold {args.fold_idx + 1} / {args.n_folds} (index: {args.fold_idx})")
+        print("=" * 60)
+
+    new_trainset, valset, testset = split_fold_data(
+        dataset, trainset, testset, args.fold_idx, args
+    )
+
+    if is_main:
+        print(
+            f"train={len(new_trainset)} | val={len(valset)} | test={len(testset)} samples"
+        )
+
+    if args.use_wandb and is_main:
+        wandb.init(
+            project="OCD_Symphony",
+            name=f"Finetuning_HCP_{args.label}_fold{args.fold_idx}",
+            reinit=True,
+            config=vars(args) if hasattr(args, "__dict__") else None,
+        )
+
+    test_acc, test_f1, history = finetune(
+        new_trainset, valset, testset, args,
+        local_rank=local_rank,
+        epoch_callback=epoch_callback
+    )
+
+    if args.use_wandb and is_main:
+        wandb.finish()
+
+    return test_acc, test_f1, history
+
+
+def run_cross_validation(args, local_rank=0, epoch_callback=None):
+    """Full K-fold leave-subject-out cross-validation using subject_kfold."""
+    is_main = is_main_process()
+    t0 = time()
+
+    dataset, subjs = make_hcp_dataset_from_pt(
+        path=os.path.join(proj_dir, "data/hcp"),
+        label=args.label,
+        n_subjs=args.n_subjs,
+    )
+    if is_main:
+        print(
+            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
+            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
+        )
+
+    folds = list(subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed))
+
+    all_accs = []
+    all_f1s = []
+    all_histories = []
+
+    for fold_idx, (trainset, testset) in enumerate(folds):
+        if is_main:
+            print("\n" + "=" * 60)
+            print(f"  Fold {fold_idx + 1} / {args.n_folds}")
+            print("=" * 60)
+
+        new_trainset, valset, testset = split_fold_data(
+            dataset, trainset, testset, fold_idx, args
+        )
+
+        if is_main:
+            print(
+                f"train={len(new_trainset)} | val={len(valset)} | test={len(testset)} samples"
+            )
+
+        if args.use_wandb and is_main:
+            wandb.init(
+                project="OCD_Symphony",
+                name=f"Finetuning_HCP_{args.label}_fold{fold_idx}",
+                reinit=True,
+                config=vars(args) if hasattr(args, "__dict__") else None,
+            )
+
+        def fold_epoch_callback(ep, metrics):
+            if epoch_callback is not None:
+                m_copy = dict(metrics)
+                m_copy["fold"] = fold_idx + 1
+                m_copy["n_folds"] = args.n_folds
+                epoch_callback(ep, m_copy)
+
+        test_acc, test_f1, history = finetune(
+            new_trainset, valset, testset, args,
+            local_rank=local_rank,
+            epoch_callback=fold_epoch_callback if epoch_callback else None
+        )
+        all_accs.append(test_acc)
+        all_f1s.append(test_f1)
+        all_histories.append(history)
+
+        if args.use_wandb and is_main:
+            wandb.finish()
+
+    mean_acc = sum(all_accs) / len(all_accs) if all_accs else 0.0
+    std_acc = (sum((a - mean_acc) ** 2 for a in all_accs) / len(all_accs)) ** 0.5 if all_accs else 0.0
+    mean_f1 = sum(all_f1s) / len(all_f1s) if all_f1s else 0.0
+    std_f1 = (sum((f - mean_f1) ** 2 for f in all_f1s) / len(all_f1s)) ** 0.5 if all_f1s else 0.0
+
+    if is_main:
+        print("\n" + "=" * 60)
+        print(f"  Cross-Validation Results  ({args.n_folds} folds)")
+        print("=" * 60)
+        for i, (acc, f1) in enumerate(zip(all_accs, all_f1s)):
+            print(f"  Fold {i+1}:  Test Acc = {acc:.4f}  |  Test F1 = {f1:.4f}")
+        print("  " + "─" * 45)
+        print(
+            f"  Mean ± Std:  Acc = {mean_acc:.4f} ± {std_acc:.4f}  |  "
+            f"F1 = {mean_f1:.4f} ± {std_f1:.4f}"
+        )
+        print("=" * 60)
+
+    cv_summary = {
+        "is_cv": True,
+        "mean_acc": mean_acc,
+        "std_acc": std_acc,
+        "mean_f1": mean_f1,
+        "std_f1": std_f1,
+        "fold_accs": all_accs,
+        "fold_f1s": all_f1s,
+        "histories": all_histories,
+    }
+    return mean_acc, mean_f1, cv_summary
 
 
 def parse_args():
@@ -458,223 +748,14 @@ def parse_args():
         help='Run full K-fold cross-validation (uses subject_kfold)'
     )
     parser.add_argument(
+        '--recon_weight', type=float, default=1e-4,
+        help='Weight for the reconstruction loss term (default: 1e-4)'
+    )
+    parser.add_argument(
         '--ddp', action='store_true',
         help='Enable DistributedDataParallel (multi-GPU). Launch with torchrun.'
     )
     return parser.parse_args()
-
-
-def run_single_split(args, local_rank=0):
-    """Single deterministic train/val/test split using subject_train_val_test_split."""
-    is_main = is_main_process()
-    t0 = time()
-
-    dataset, subjs = make_hcp_dataset_from_pt(
-        path=os.path.join(proj_dir, 'data/hcp'),
-        label=args.label,
-        n_subjs=args.n_subjs,
-    )
-    if is_main:
-        print(
-            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
-            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
-        )
-
-    trainset, valset, testset = subject_train_val_test_split(
-        dataset, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed,
-    )
-
-    if args.use_wandb and is_main:
-        wandb.init(
-            project="OCD_Symphony",
-            name=f"Finetuning_HCP_{args.label}_single",
-        )
-
-    test_acc, test_f1 = finetune(trainset, valset, testset, args, local_rank=local_rank)
-
-    if args.use_wandb and is_main:
-        wandb.finish()
-
-    return test_acc, test_f1
-
-
-def split_fold_data(dataset, trainset, testset, fold_idx, args):
-    """
-    Split a cross-validation fold's trainset into train and validation sets
-    using subject-level StratifiedGroupKFold without data leakage.
-    """
-    ds = dataset  # the original FMRIDataset
-
-    # Determine training subjects and their labels
-    train_sample_indices = list(trainset.indices)
-    train_subjs = ds.subjs[train_sample_indices]
-
-    # Get unique training subjects with consensus labels (majority vote per subject)
-    unique_train_subjs = np.unique(train_subjs)
-    train_labels_subj = []
-    for s in unique_train_subjs:
-        mask = train_subjs == s
-        lbls = ds.encoded_labels.numpy()[train_sample_indices][mask]
-        counts = np.bincount(lbls)
-        train_labels_subj.append(np.argmax(counts))
-    train_labels_subj = np.array(train_labels_subj)
-
-    # StratifiedGroupKFold on training subjects for val hold-out
-    n_inner = max(2, round(1.0 / args.val_frac))
-    inner_sgkf = StratifiedGroupKFold(
-        n_splits=n_inner, shuffle=True, random_state=args.seed + fold_idx
-    )
-    inner_splits = list(
-        inner_sgkf.split(unique_train_subjs, train_labels_subj, groups=unique_train_subjs)
-    )
-    # Last fold → validation
-    _, val_subj_idx = inner_splits[-1]
-    train_subj_idx = np.setdiff1d(
-        np.arange(len(unique_train_subjs)), val_subj_idx
-    )
-
-    val_subjs = unique_train_subjs[val_subj_idx]
-    new_train_subjs = unique_train_subjs[train_subj_idx]
-
-    # Verify no leakage (assertion raises if overlap detected)
-    for s in val_subjs:
-        assert s not in new_train_subjs, f"Subject leakage detected: {s}"
-
-    # Map subject IDs to sample indices
-    val_sample_indices = np.where(np.isin(ds.subjs, val_subjs))[0].tolist()
-    new_train_sample_indices = np.where(np.isin(ds.subjs, new_train_subjs))[0].tolist()
-
-    new_trainset = Subset(ds, new_train_sample_indices)
-    valset = Subset(ds, val_sample_indices)
-
-    return new_trainset, valset, testset
-
-
-def run_single_fold(args, local_rank=0):
-    """Run fine-tuning for a single specified CV fold."""
-    is_main = is_main_process()
-    t0 = time()
-
-    if args.fold_idx < 0 or args.fold_idx >= args.n_folds:
-        raise ValueError(
-            f"--fold_idx must be between 0 and {args.n_folds - 1}, got {args.fold_idx}"
-        )
-
-    dataset, subjs = make_hcp_dataset_from_pt(
-        path=os.path.join(proj_dir, 'data/hcp'),
-        label=args.label,
-        n_subjs=args.n_subjs,
-    )
-    if is_main:
-        print(
-            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
-            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
-        )
-
-    folds = list(subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed))
-    trainset, testset = folds[args.fold_idx]
-
-    if is_main:
-        print(f"\n{'='*60}")
-        print(f"  Running Fold {args.fold_idx + 1} / {args.n_folds} (index: {args.fold_idx})")
-        print(f"{'='*60}")
-
-    new_trainset, valset, testset = split_fold_data(
-        dataset, trainset, testset, args.fold_idx, args
-    )
-
-    if is_main:
-        print(
-            f"train={len(new_trainset)} | val={len(valset)} | test={len(testset)} samples"
-        )
-
-    if args.use_wandb and is_main:
-        wandb.init(
-            project="OCD_Symphony",
-            name=f"Finetuning_HCP_{args.label}_fold{args.fold_idx}",
-            reinit=True,
-        )
-
-    test_acc, test_f1 = finetune(new_trainset, valset, testset, args, local_rank=local_rank)
-
-    if args.use_wandb and is_main:
-        wandb.finish()
-
-    return test_acc, test_f1
-
-
-def run_cross_validation(args, local_rank=0):
-    """
-    Full K-fold leave-subject-out cross-validation using subject_kfold.
-    The val fold from each CV split is used as the test set here.
-    """
-    is_main = is_main_process()
-    t0 = time()
-
-    dataset, subjs = make_hcp_dataset_from_pt(
-        path=os.path.join(proj_dir, 'data/hcp'),
-        label=args.label,
-        n_subjs=args.n_subjs,
-    )
-    if is_main:
-        print(
-            f"Dataset loaded in {time()-t0:.1f}s ({(time()-t0)/60:.1f} min) | "
-            f"{len(np.unique(subjs))} subjects | {len(dataset)} samples"
-        )
-
-    folds = subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed)
-
-    all_accs = []
-    all_f1s  = []
-
-    for fold_idx, (trainset, testset) in enumerate(folds):
-        if is_main:
-            print(f"\n{'='*60}")
-            print(f"  Fold {fold_idx + 1} / {args.n_folds}")
-            print(f"{'='*60}")
-
-        new_trainset, valset, testset = split_fold_data(
-            dataset, trainset, testset, fold_idx, args
-        )
-
-        if is_main:
-            print(
-                f"train={len(new_trainset)} | val={len(valset)} | test={len(testset)} samples"
-            )
-
-        if args.use_wandb and is_main:
-            wandb.init(
-                project="OCD_Symphony",
-                name=f"Finetuning_HCP_{args.label}_fold{fold_idx}",
-                reinit=True,
-            )
-
-        test_acc, test_f1 = finetune(new_trainset, valset, testset, args, local_rank=local_rank)
-        all_accs.append(test_acc)
-        all_f1s.append(test_f1)
-
-        if args.use_wandb and is_main:
-            wandb.finish()
-
-    # ── Aggregate CV results (main process only) ────────────────────────────
-    if is_main:
-        print(f"\n{'='*60}")
-        print(f"  Cross-Validation Results  ({args.n_folds} folds)")
-        print(f"{'='*60}")
-        for i, (acc, f1) in enumerate(zip(all_accs, all_f1s)):
-            print(f"  Fold {i+1}:  Test Acc = {acc:.4f}  |  Test F1 = {f1:.4f}")
-        print(f"  {'─'*45}")
-        mean_acc = sum(all_accs) / len(all_accs)
-        std_acc = (sum((a - mean_acc) ** 2 for a in all_accs) / len(all_accs)) ** 0.5
-        mean_f1 = sum(all_f1s) / len(all_f1s)
-        std_f1 = (sum((f - mean_f1) ** 2 for f in all_f1s) / len(all_f1s)) ** 0.5
-        print(
-            f"  Mean ± Std:  Acc = {mean_acc:.4f} ± {std_acc:.4f}  |  "
-            f"F1 = {mean_f1:.4f} ± {std_f1:.4f}"
-        )
-        print(f"{'='*60}")
-
-    return all_accs, all_f1s
 
 
 if __name__ == '__main__':
