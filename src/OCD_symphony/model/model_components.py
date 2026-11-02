@@ -32,6 +32,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.pe = pe.unsqueeze(0)  # Shape: (1, max_len, dim)
         self.alpha = nn.Parameter(torch.tensor(0.1))  # Initialized small
         self.ln = nn.LayerNorm(dim)
+
     def forward(self, x):
         """
         x: Shape (batch, time_steps, dim) -> Ensure the embedding dimension is correct
@@ -611,6 +612,19 @@ class MaskedROIWiseTransformer(nn.Module):
 
 
 
+def _random_keep_mask(shape, num_mask, device):
+    """Vectorised random mask: 1 = keep, 0 = masked.
+
+    Along the last dimension exactly ``num_mask`` entries are set to 0 for every
+    leading index (equivalent to a per-row ``randperm(N)[:num_mask]``), without
+    any Python loop. Random numbers are drawn directly on ``device``.
+    """
+    if num_mask <= 0:
+        return torch.ones(shape, device=device)
+    ranks = torch.rand(shape, device=device).argsort(dim=-1).argsort(dim=-1)
+    return (ranks >= num_mask).float()
+
+
 class TokenMasker1D(nn.Module):
     def __init__(self, mask_ratio=0.15):
         super().__init__()
@@ -618,13 +632,8 @@ class TokenMasker1D(nn.Module):
 
     def forward(self, x):
         B, R, T = x.shape
-        mask = torch.ones((B, T), device=x.device)
-
         num_mask = int(self.mask_ratio * T)
-        for b in range(B):
-            idx = torch.randperm(T)[:num_mask]
-            mask[b, idx] = 0
-        return mask  # shape: (B, T)
+        return _random_keep_mask((B, T), num_mask, x.device)  # shape: (B, T)
 
 
 
@@ -678,14 +687,8 @@ class TokenMasker2D(nn.Module):
         Returns: mask of shape (B, R), where 0 = masked, 1 = visible
         """
         B, R, T = x.shape
-        mask = torch.ones((B, R), device=x.device)
-
         num_mask = int(self.mask_ratio * R)
-        for b in range(B):
-            idx = torch.randperm(R)[:num_mask]
-            mask[b, idx] = 0
-
-        return mask  # shape: (B, R)
+        return _random_keep_mask((B, R), num_mask, x.device)  # shape: (B, R)
 
 
 
@@ -743,13 +746,8 @@ class TimePointMasker(nn.Module):
 
     def forward(self, x):
         B, R, T = x.shape
-        mask = torch.ones((B, R, T), device=x.device)
         num_mask = int(self.mask_ratio * T)
-        for b in range(B):
-            for r in range(R):
-                idx = torch.randperm(T)[:num_mask]
-                mask[b, r, idx] = 0
-        return mask
+        return _random_keep_mask((B, R, T), num_mask, x.device)
 
 
 
@@ -966,35 +964,80 @@ class PerceiverIOModelROIWise(nn.Module):
 
 
 class PerceiverClassifier(nn.Module):
-    def __init__(self, pretrained_perceiver: PerceiverIOModelROIWise, latent_dim: int = 512, num_classes: int = 2):
+    def __init__(
+        self,
+        pretrained_perceiver: PerceiverIOModelROIWise,
+        latent_dim: int = 512,
+        num_classes: int = 2,
+        pooling: str = "flatten",
+        dropout: float = 0.3,
+        num_heads: int = 4,
+    ):
         super().__init__()
         self.perceiver = pretrained_perceiver
+        self.pooling = pooling
 
-        self.reduction = nn.Sequential(nn.Linear(latent_dim, 30))
-
-       
-
-        self.classifier = nn.Sequential(
-            nn.Linear(30*450, 64),
-            nn.LeakyReLU(),
-            # nn.Dropout(0.3),
-            nn.Linear(64, 16),
-            nn.LeakyReLU(),
-            # nn.Dropout(0.3),
-            nn.Linear(16, num_classes)  # Binary classification logits
-        )
-        
-      
+        if pooling == "flatten":
+            self.reduction = nn.Sequential(nn.Linear(latent_dim, 30))
+            self.classifier = nn.Sequential(
+                nn.Linear(30 * 450, 64),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(64, 16),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(16, num_classes),
+            )
+        elif pooling == "mean":
+            self.classifier = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.LayerNorm(64),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(64, 32),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(32, num_classes),
+            )
+        elif pooling == "attention":
+            self.cls_token = nn.Parameter(torch.randn(1, 1, latent_dim))
+            self.pool_attn = nn.MultiheadAttention(
+                embed_dim=latent_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.pool_norm = nn.LayerNorm(latent_dim)
+            self.classifier = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.LayerNorm(64),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(64, 32),
+                nn.LeakyReLU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(32, num_classes),
+            )
+        else:
+            raise ValueError(
+                f"Unknown pooling method '{pooling}'. Must be 'mean', 'attention', or 'flatten'."
+            )
 
     def forward(self, roi_embeds, time_embeds, context_features, roi_pos):
-        recon, latents,_ = self.perceiver(roi_embeds, time_embeds, context_features, roi_pos)  # (B, R, D)
-        
-        # global_latent = latents.mean(dim=1)  # mean-pool across ROIs (B, D)
-        
-        reduced = self.reduction(latents)  
-        global_latent = reduced.reshape(reduced.size(0), -1)  # (B, 450*10)
-        
-        logits = self.classifier(global_latent)  # (B, num_classes)
+        recon, latents, _ = self.perceiver(roi_embeds, time_embeds, context_features, roi_pos)  # (B, R, D)
+
+        if self.pooling == "flatten":
+            reduced = self.reduction(latents)  # (B, 450, 30)
+            pooled = reduced.reshape(reduced.size(0), -1)  # (B, 13500)
+        elif self.pooling == "mean":
+            pooled = latents.mean(dim=1)  # (B, D)
+        elif self.pooling == "attention":
+            B = latents.size(0)
+            cls_q = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+            attn_out, _ = self.pool_attn(query=cls_q, key=latents, value=latents)  # (B, 1, D)
+            pooled = self.pool_norm(attn_out.squeeze(1))  # (B, D)
+
+        logits = self.classifier(pooled)
         return logits, recon
 
 

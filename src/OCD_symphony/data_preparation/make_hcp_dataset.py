@@ -12,6 +12,7 @@
 #      guarantee that every sample from a given subject lands in exactly
 #      one partition (no leakage between train and val/test).
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Generator, Iterator, List, Optional, Tuple
@@ -53,35 +54,128 @@ def load_hcp_age_gender(subjs):
 
 
 
-def _load_raw_file(fname: str) -> Optional[Dict]:
+def _load_raw_file(fname: str, max_abs: float = 1e4) -> Dict:
     """
     Load one .pt file from disk and return minimally reshaped tensors + metadata.
     No normalisation or ROI reindexing yet – those happen once on the full batch.
+
+    Data validation (run level)
+    ---------------------------
+    A run (one row of the flattened ``(n, 450, 200)`` fMRI array) is dropped if
+
+    * its fMRI contains non-finite values,
+    * its fMRI ``abs().max()`` exceeds ``max_abs`` (corrupted / un-scaled data), or
+    * its FC matrix contains non-finite values.
+
+    If no run survives (or the file cannot be read) the returned dict has
+    ``excluded=True`` and a ``reason``; it never returns ``None`` so the caller
+    can report *why* a subject is missing.
     """
+    subj = os.path.basename(fname)[:-3]
     try:
         tnsr = torch.load(fname, map_location="cpu", weights_only=True)
-        subj = os.path.basename(fname)[:-3]
 
         fmri = tnsr["fmri_data"]  # e.g. (sessions, runs, 450, 200)
         fc   = tnsr["fc_data"]
 
         # Flatten leading dims → (n_samples, n_rois, T_or_rois)
         n = fmri.shape[0] * fmri.shape[1]
-        fmri = fmri.reshape(n, fmri.shape[-2], fmri.shape[-1])  # (n, 450, 200)
-        fc   = fc.reshape(  n, fc.shape[-2],   fc.shape[-1])    # (n, 450, 450)
+        fmri = fmri.reshape(n, fmri.shape[-2], fmri.shape[-1]).float()  # (n, 450, 200)
+        fc   = fc.reshape(  n, fc.shape[-2],   fc.shape[-1]).float()    # (n, 450, 450)
+
+        # ── Per-run validation ──────────────────────────────────────────────
+        fmri_finite = torch.isfinite(fmri).flatten(1).all(dim=1)         # (n,)
+        fc_finite   = torch.isfinite(fc).flatten(1).all(dim=1)           # (n,)
+        # abs-max computed on a finite-only copy so NaN/inf runs do not mask
+        # the magnitude check of the others.
+        safe_abs = torch.where(torch.isfinite(fmri), fmri.abs(), torch.zeros_like(fmri))
+        run_absmax = safe_abs.flatten(1).amax(dim=1)                      # (n,)
+        too_big = run_absmax > max_abs
+
+        dropped_runs = []
+        keep = torch.ones(n, dtype=torch.bool)
+        for i in range(n):
+            reasons = []
+            if not bool(fmri_finite[i]):
+                reasons.append("non-finite fMRI")
+            if bool(too_big[i]):
+                reasons.append(f"fMRI |max|={run_absmax[i].item():.3g} > {max_abs:g}")
+            if not bool(fc_finite[i]):
+                reasons.append("non-finite FC")
+            if reasons:
+                keep[i] = False
+                dropped_runs.append((i, "; ".join(reasons)))
+
+        n_keep = int(keep.sum())
+        if n_keep == 0:
+            return dict(
+                subj=subj, excluded=True, n_runs_total=n,
+                reason=f"all {n} runs invalid (first: {dropped_runs[0][1]})",
+                dropped_runs=dropped_runs,
+            )
+        if n_keep < n:
+            fmri, fc = fmri[keep], fc[keep]
 
         age, gender = load_hcp_age_gender([subj])
         return dict(
             fmri=fmri,
             fc=fc,
             subj=subj,
-            n=n,
+            n=n_keep,
+            n_runs_total=n,
+            dropped_runs=dropped_runs,
+            excluded=False,
             age=age[0]    if age    else "unknown",
             gender=gender[0] if gender else "unknown",
         )
     except Exception as exc:
         print(f"[WARN] Skipping {fname}: {exc}")
-        return None
+        return dict(
+            subj=subj, excluded=True, n_runs_total=0,
+            reason=f"load error: {exc}", dropped_runs=[],
+        )
+
+
+def _report_exclusions(records: List[Dict], path_out: Optional[str] = None) -> List[Dict]:
+    """Print (and optionally persist) a table of excluded subjects / dropped runs.
+
+    Returns the report as a list of dicts with keys
+    ``subject``, ``run`` (``None`` = whole subject) and ``reason``.
+    """
+    report: List[Dict] = []
+    for r in records:
+        if r.get("excluded"):
+            report.append(dict(subject=r["subj"], run=None, reason=r["reason"]))
+        else:
+            for run_idx, reason in r.get("dropped_runs", []):
+                report.append(dict(subject=r["subj"], run=int(run_idx), reason=reason))
+
+    n_subj_excl = sum(1 for r in records if r.get("excluded"))
+    n_runs_drop = sum(
+        len(r.get("dropped_runs", [])) for r in records if not r.get("excluded")
+    )
+    if report:
+        print(
+            f"\n⚠ Data validation: excluded {n_subj_excl} subject(s), "
+            f"dropped {n_runs_drop} individual run(s) from kept subjects"
+        )
+        print(f"{'Subject':>10}  {'Run':>8}  Reason")
+        print("─" * 72)
+        for row in report:
+            run_str = "ALL" if row["run"] is None else str(row["run"])
+            print(f"{row['subject']:>10}  {run_str:>8}  {row['reason']}")
+        print()
+    else:
+        print("Data validation: all subjects / runs passed.")
+
+    if path_out is not None:
+        try:
+            os.makedirs(os.path.dirname(path_out), exist_ok=True)
+            with open(path_out, "w") as f:
+                json.dump(report, f, indent=2)
+        except Exception as exc:  # reporting must never break training
+            print(f"[WARN] Could not write exclusion report to {path_out}: {exc}")
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +246,9 @@ def make_hcp_dataset_from_pt(
     num_io_workers: int = 16,     # threads for parallel disk reads
     device:      str = "cpu",     # "cuda" to keep tensors in VRAM
     approx_quantile_samples: Optional[int] = 200_000,  # None = exact (slower)
+    max_abs:     float = 1e4,      # runs with |fMRI| above this are treated as corrupted
+    quantile_seed: int = 0,        # seed for the quantile sub-sampling (reproducible stats)
+    exclusion_report_path: Optional[str] = None,  # default: results/data_exclusions.json
 ) -> Tuple[FMRIDataset, np.ndarray]:
     """
     Build a fully cached FMRIDataset.
@@ -159,11 +256,16 @@ def make_hcp_dataset_from_pt(
     Pipeline
     --------
     1. Discover .pt files
-    2. Load all files in parallel (ThreadPoolExecutor)
+    2. Load all files in parallel (ThreadPoolExecutor), validating every run
+       (non-finite fMRI/FC or |fMRI| > ``max_abs`` -> run dropped; no valid run
+       -> subject excluded). Exclusions are printed and attached to the dataset
+       as ``ds.exclusion_report``. No back-filling: ``n_subjs`` selects the
+       files *before* validation, so fewer subjects may be returned.
     3. Concatenate into contiguous tensors
     4. ROI reindexing (once, on the whole dataset)
     5. Per-ROI robust statistics  (median / IQR / mean / std)
-    6. Compute W, B and apply normalisation in-place
+    6. Compute W, B and apply normalisation in-place (with a sanity check that
+       raises if the normalised data is not ~unit-variance)
     7. Optionally move everything to GPU
 
     Parameters
@@ -172,6 +274,14 @@ def make_hcp_dataset_from_pt(
         If an int, draw this many time-point samples per ROI before computing
         quantiles (much faster, negligibly different in practice for >1M pts).
         Pass None for the exact calculation.
+    max_abs : float
+        Maximum tolerated absolute raw fMRI value per run (legitimate HCP-YA
+        data peaks at ~1.3e3).
+    quantile_seed : int
+        Seed of the generator used for the quantile sub-sampling.
+    exclusion_report_path : str or None
+        Where the JSON exclusion report is written (default
+        ``<proj_dir>/results/data_exclusions.json``).
     """
 
     # ── 1. File discovery ────────────────────────────────────────────────────
@@ -187,17 +297,23 @@ def make_hcp_dataset_from_pt(
     # ── 2. Parallel file load ─────────────────────────────────────────────────
     records: List[Dict] = []
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
-        futures = {ex.submit(_load_raw_file, f): f for f in fnames}
+        futures = {ex.submit(_load_raw_file, f, max_abs): f for f in fnames}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading files"):
             rec = fut.result()
             if rec is not None:
                 records.append(rec)
 
-    if not records:
-        raise RuntimeError("No files loaded successfully.")
-
     # Keep deterministic order (as_completed is non-deterministic)
     records.sort(key=lambda r: r["subj"])
+
+    # ── 2b. Data validation report + removal of excluded subjects ─────────────
+    if exclusion_report_path is None:
+        exclusion_report_path = os.path.join(proj_dir, "results", "data_exclusions.json")
+    exclusion_report = _report_exclusions(records, path_out=exclusion_report_path)
+    records = [r for r in records if not r.get("excluded")]
+
+    if not records:
+        raise RuntimeError("No valid subjects loaded (all files failed validation).")
 
     n_unique_subjs  = len(records)
     n_total_samples = sum(r["n"] for r in records)
@@ -234,7 +350,8 @@ def make_hcp_dataset_from_pt(
 
     if approx_quantile_samples is not None and fmri_flat.shape[1] > approx_quantile_samples:
         # Fast path: random sub-sample columns per ROI (results are very close to exact)
-        col_idx = torch.randperm(fmri_flat.shape[1])[:approx_quantile_samples]
+        gen = torch.Generator().manual_seed(quantile_seed)
+        col_idx = torch.randperm(fmri_flat.shape[1], generator=gen)[:approx_quantile_samples]
         q = torch.quantile(
             fmri_flat[:, col_idx],
             torch.tensor([0.25, 0.5, 0.75]),
@@ -263,6 +380,25 @@ def make_hcp_dataset_from_pt(
     print("Applying normalisation …")
     all_fmri = all_fmri * W.reshape(1, -1, 1) + B.reshape(1, -1, 1)
 
+    # ── 6b. Post-normalisation sanity check ───────────────────────────────────
+    # A single corrupted subject inflates the pooled statistics and silently
+    # squashes everyone else towards zero; fail loudly instead.
+    norm_std = all_fmri.std(dim=(0, 2))                            # (450,) per-ROI
+    norm_absmax = all_fmri.abs().max().item()
+    if (
+        not torch.isfinite(norm_std).all()
+        or norm_std.min().item() < 0.5
+        or norm_std.max().item() > 2.0
+        or norm_absmax > 200.0
+    ):
+        raise RuntimeError(
+            "Normalised fMRI failed the sanity check "
+            f"(per-ROI std in [{norm_std.min().item():.3g}, {norm_std.max().item():.3g}], "
+            f"|x|max={norm_absmax:.3g}); expected std≈1 and |x|max<200. "
+            "Likely cause: an outlier subject/run slipped past validation "
+            f"(current max_abs={max_abs:g}). Lower --max_abs or inspect the raw files."
+        )
+
     # ── 7. G_tensor placeholder ───────────────────────────────────────────────
     all_G = torch.randn(N, 450, 10)
 
@@ -276,6 +412,7 @@ def make_hcp_dataset_from_pt(
             torch.cuda.synchronize()
 
     ds = FMRIDataset(all_fmri, all_fc, all_G, all_ages, all_genders, all_subjs, label)
+    ds.exclusion_report = exclusion_report
     return ds, all_subjs
 
 
@@ -504,6 +641,22 @@ def subject_train_val_test_split(
         subj_groups=[train_subjs, val_subjs, test_subjs],
         idx_groups =[train_idx,  val_idx,   test_idx],
     )
+
+    # ── Cheap sanity check: signal power per split ────────────────────────────
+    # After normalisation every split should have mean-square ≈ 1. A large
+    # discrepancy flags an outlier subject that slipped through validation.
+    ms = []
+    for idx in (train_idx, val_idx, test_idx):
+        sel = np.random.default_rng(seed).choice(idx, size=min(len(idx), 256), replace=False)
+        ms.append(float(ds.fmri_data[torch.as_tensor(sel, device=ds.fmri_data.device)].pow(2).mean()))
+    print(
+        f"Signal mean-square  train={ms[0]:.3g} | val={ms[1]:.3g} | test={ms[2]:.3g}"
+    )
+    if max(ms) / max(min(ms), 1e-12) > 100:
+        print(
+            "⚠ WARNING: signal power differs by >100x between splits – "
+            "check for outlier subjects / corrupted runs."
+        )
 
     return Subset(ds, train_idx), Subset(ds, val_idx), Subset(ds, test_idx)
 
