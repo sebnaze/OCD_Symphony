@@ -413,6 +413,10 @@ def make_hcp_dataset_from_pt(
 
     ds = FMRIDataset(all_fmri, all_fc, all_G, all_ages, all_genders, all_subjs, label)
     ds.exclusion_report = exclusion_report
+    # Per-ROI affine normalisation (x -> W*x + B) fitted on the full dataset; exposed so
+    # subsets can be normalised identically without reloading every subject.
+    ds.norm_W = W.detach().cpu()
+    ds.norm_B = B.detach().cpu()
     return ds, all_subjs
 
 

@@ -287,78 +287,83 @@ def _(
     subjs_input,
     wandb_checkbox,
 ):
-    mo.stop(not run_btn.value, mo.md("👉 *Configure parameters above and click **Start Fine-tuning** to run.* "))
+    # Outputs are always defined so downstream cells can read them before
+    # training starts. Marimo compiles each cell body on its own, so an early
+    # `return` is not allowed here; the work is gated with `if` instead.
+    config, history, test_acc, test_f1 = None, None, None, None
 
-    clean_gpu_memory()
-
-    is_cv_mode = mode_selector.value == "Full Cross-Validation (K-Fold)"
-    is_fold_mode = mode_selector.value == "Single Fold (CV)"
-
-    # ── Training stage → mode / freeze / encoder-lr / DAPT checkpoint ────────
-    stage = stage_selector.value
-    is_dapt = stage == "dapt"
-    freeze_perceiver = stage == "stage1"
-    encoder_lr = float(encoder_lr_dropdown.value) if stage == "stage3_2" else 0.0
-    dapt_ckpt = (dapt_ckpt_input.value.strip() or None) if stage == "stage3_2" else None
-
-    args = SimpleNamespace(
-        label=label_selector.value,
-        n_epochs=int(epochs_slider.value),
-        batch_size=int(batch_size_dropdown.value),
-        learning_rate=float(lr_dropdown.value),
-        backbone_lr=float(backbone_lr_dropdown.value),
-        freeze_perceiver=freeze_perceiver,
-        n_subjs=subjs_input.value,
-        n_folds=5,
-        fold_idx=int(fold_slider.value) if is_fold_mode else None,
-        test_frac=0.15,
-        val_frac=0.15,
-        seed=int(seed_input.value),
-        use_wandb=bool(wandb_checkbox.value),
-        pooling=str(pooling_selector.value),
-        dropout=float(dropout_slider.value),
-        recon_weight=float(recon_slider.value),
-        cv=is_cv_mode,
-        ddp=False,
-        # ── Stage 3 (DAPT) ──
-        mode="dapt" if is_dapt else "cls",
-        dapt_ckpt=dapt_ckpt,
-        dapt_mask_ratio=None,
-        dapt_mask_ratio_spatial=float(dapt_mask_spatial_slider.value),
-        dapt_mask_ratio_temporal=float(dapt_mask_temporal_slider.value),
-        dapt_mask_ratio_context=float(dapt_mask_context_slider.value),
-        dapt_weights=str(dapt_weights_input.value or "1,1,1,1"),
-        dapt_ckpt_name=(dapt_ckpt_name_input.value.strip() or None),
-        encoder_lr=encoder_lr,
-        # ── Robustness (data validation / DAPT guard) ──
-        grad_clip=1.0,
-        max_abs=1e4,
-        val_mask_seed=1234,
-    )
-
-    try:
-        if is_dapt:
-            spinner_msg = "Running DAPT (Stage 3.1) reconstruction pretraining..."
-        elif is_cv_mode:
-            spinner_msg = "Running 5-Fold Cross-Validation..."
-        else:
-            spinner_msg = f"Training Perceiver Classifier ({mode_selector.value})..."
-
-        with mo.status.spinner(title=spinner_msg):
-            if is_dapt:
-                # Stage 3.1 is a single reconstruction-pretraining run.
-                _ckpt_path, history = run_dapt(args)
-                test_acc, test_f1 = None, None
-            elif is_cv_mode:
-                test_acc, test_f1, history = run_cross_validation(args)
-            elif is_fold_mode:
-                test_acc, test_f1, history = run_single_fold(args)
-            else:
-                test_acc, test_f1, history = run_single_split(args)
-    finally:
+    if run_btn.value:
         clean_gpu_memory()
 
-    config = vars(args) if hasattr(args, "__dict__") else {}
+        is_cv_mode = mode_selector.value == "Full Cross-Validation (K-Fold)"
+        is_fold_mode = mode_selector.value == "Single Fold (CV)"
+
+        # ── Training stage → mode / freeze / encoder-lr / DAPT checkpoint ────────
+        stage = stage_selector.value
+        is_dapt = stage == "dapt"
+        freeze_perceiver = stage == "stage1"
+        encoder_lr = float(encoder_lr_dropdown.value) if stage == "stage3_2" else 0.0
+        dapt_ckpt = (dapt_ckpt_input.value.strip() or None) if stage == "stage3_2" else None
+
+        args = SimpleNamespace(
+            label=label_selector.value,
+            n_epochs=int(epochs_slider.value),
+            batch_size=int(batch_size_dropdown.value),
+            learning_rate=float(lr_dropdown.value),
+            backbone_lr=float(backbone_lr_dropdown.value),
+            freeze_perceiver=freeze_perceiver,
+            n_subjs=subjs_input.value,
+            n_folds=5,
+            fold_idx=int(fold_slider.value) if is_fold_mode else None,
+            test_frac=0.15,
+            val_frac=0.15,
+            seed=int(seed_input.value),
+            use_wandb=bool(wandb_checkbox.value),
+            pooling=str(pooling_selector.value),
+            dropout=float(dropout_slider.value),
+            recon_weight=float(recon_slider.value),
+            cv=is_cv_mode,
+            ddp=False,
+            # ── Stage 3 (DAPT) ──
+            mode="dapt" if is_dapt else "cls",
+            dapt_ckpt=dapt_ckpt,
+            dapt_mask_ratio=None,
+            dapt_mask_ratio_spatial=float(dapt_mask_spatial_slider.value),
+            dapt_mask_ratio_temporal=float(dapt_mask_temporal_slider.value),
+            dapt_mask_ratio_context=float(dapt_mask_context_slider.value),
+            dapt_weights=str(dapt_weights_input.value or "1,1,1,1"),
+            dapt_ckpt_name=(dapt_ckpt_name_input.value.strip() or None),
+            encoder_lr=encoder_lr,
+            # ── Robustness (data validation / DAPT guard) ──
+            grad_clip=1.0,
+            max_abs=1e4,
+            val_mask_seed=1234,
+        )
+
+        try:
+            if is_dapt:
+                spinner_msg = "Running DAPT (Stage 3.1) reconstruction pretraining..."
+            elif is_cv_mode:
+                spinner_msg = "Running 5-Fold Cross-Validation..."
+            else:
+                spinner_msg = f"Training Perceiver Classifier ({mode_selector.value})..."
+
+            with mo.status.spinner(title=spinner_msg):
+                if is_dapt:
+                    # Stage 3.1 is a single reconstruction-pretraining run.
+                    _ckpt_path, history = run_dapt(args)
+                    test_acc, test_f1 = None, None
+                elif is_cv_mode:
+                    test_acc, test_f1, history = run_cross_validation(args)
+                elif is_fold_mode:
+                    test_acc, test_f1, history = run_single_fold(args)
+                else:
+                    test_acc, test_f1, history = run_single_split(args)
+        finally:
+            clean_gpu_memory()
+
+        config = vars(args) if hasattr(args, "__dict__") else {}
+
     return config, history, test_acc, test_f1
 
 
@@ -855,10 +860,298 @@ def _():
 @app.cell
 def _(config, history, mo, plt, render_history, test_acc, test_f1):
     _is_dapt = isinstance(history, dict) and history.get("is_dapt", False)
-    mo.stop(test_acc is None and not _is_dapt)
+    mo.stop(
+        test_acc is None and not _is_dapt,
+        mo.md("👉 *Configure parameters above and click **Start Fine-tuning** to run.*"),
+    )
 
     live_view = render_history(history, test_acc, test_f1, mo, plt, config=config)
     live_view
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    # ── DAPT reconstruction trace viewer controls (test subjects by default) ──
+    recon_roi_strategy = mo.ui.dropdown(
+        options={
+            "One ROI per network": "network",
+            "Best R² ROIs": "best",
+            "Worst R² ROIs": "worst",
+            "Median R² ROIs": "median",
+        },
+        value="One ROI per network",
+        label="ROI selection",
+    )
+    recon_n_rois = mo.ui.slider(start=2, stop=20, value=10, step=1, label="Number of ROIs")
+    recon_t_window = mo.ui.range_slider(start=0, stop=200, value=[0, 100], step=1, label="Time window (TRs)")
+    # Sample index (not subject index): a subject can contribute several runs, so the
+    # value is clamped to the actual split length in the view cell.
+    recon_subject_idx = mo.ui.number(start=0, stop=5000, value=0, step=1, label="Sample index in split")
+    recon_fraction = mo.ui.slider(
+        start=10, stop=100, step=10, value=10,
+        label="Fraction of held-out test subjects (%)",
+    )
+    recon_run_btn = mo.ui.run_button(label="🧠 Reconstruct BOLD (run inference)", kind="success")
+    recon_plot_width = mo.ui.slider(
+        start=400, stop=1200, step=50, value=600, label="Plot width (px)",
+    )
+    return (
+        recon_fraction,
+        recon_n_rois,
+        recon_plot_width,
+        recon_roi_strategy,
+        recon_run_btn,
+        recon_subject_idx,
+        recon_t_window,
+    )
+
+
+@app.cell
+def _(mo):
+    # Cache of reconstructions keyed by checkpoint so changing plot controls
+    # does not re-run the model. Lives for the lifetime of the marimo session.
+    get_recon_cache, set_recon_cache = mo.state({})
+    return get_recon_cache, set_recon_cache
+
+
+@app.cell
+def _(mo):
+    # Loaded-run checkpoint, created once in its own cell so it is not reset when
+    # the run selector re-runs.
+    get_loaded_ckpt, set_loaded_ckpt = mo.state(None)
+    return get_loaded_ckpt, set_loaded_ckpt
+
+
+@app.cell
+def _(load_btn, run_metas, run_selector, set_loaded_ckpt):
+    # Store the checkpoint of the loaded DAPT run in state when Load is clicked.
+    # Handles both run kinds: "results" (JSON history carries ckpt_path) and
+    # "wandb" (parsed from output.log, which has no ckpt_path, so recover it from
+    # the "[DAPT] Saved checkpoint to ..." line or the matching results JSON).
+    import glob as _glob
+    import json as _json
+    import os as _os
+    import re as _re
+    from OCD_symphony.utils import proj_dir as _proj_dir
+
+    def _find_ckpt(_meta):
+        _cands = []
+        if _meta.get("kind") == "results":
+            with open(_meta["path"]) as _f:
+                _cands.append((_json.load(_f).get("history") or {}).get("ckpt_path"))
+        else:
+            with open(_meta["path"], errors="replace") as _f:
+                _m = _re.findall(r"\[DAPT\] Saved checkpoint to (\S+)", _f.read())
+            if _m:
+                _cands.append(_m[-1])
+            # Fallback: results JSON saved with the same W&B id suffix.
+            for _p in _glob.glob(_os.path.join(_proj_dir, "results", "runs", f"*_{_meta['run_id']}.json")):
+                with open(_p) as _f:
+                    _cands.append((_json.load(_f).get("history") or {}).get("ckpt_path"))
+            # Fallback: explicit checkpoint name from the run config.
+            _name = (_meta.get("config") or {}).get("dapt_ckpt_name")
+            if _name:
+                _cands.append(_os.path.join(_proj_dir, "models", _name))
+        return next((_c for _c in _cands if _c and _os.path.isfile(_c)), None)
+
+    if run_selector is not None and load_btn is not None and load_btn.value:
+        _meta = run_metas.get(run_selector.value)
+        if _meta is not None:
+            _ck = _find_ckpt(_meta)
+            if _ck:
+                set_loaded_ckpt(_ck)
+
+
+
+@app.cell
+def _(plt):
+    import io as _io
+
+    def fig_to_png(fig, dpi=120):
+        """Rasterise a matplotlib figure to PNG bytes (and close it) so it can be
+        shown with a controlled pixel width via ``mo.image``."""
+        _buf = _io.BytesIO()
+        fig.savefig(_buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        return _buf.getvalue()
+
+    return (fig_to_png,)
+
+
+@app.cell
+def _(
+    get_loaded_ckpt,
+    get_recon_cache,
+    mo,
+    recon_fraction,
+    recon_run_btn,
+    set_recon_cache,
+):
+    # ── Reconstruction: inference + cache (controls header) ──────────────────
+    from OCD_symphony.reconstruction.dapt_reconstruction import (
+        default_device, estimate_seconds_per_subject, fit_normalisation_stats,
+        reconstruct_subjects, select_test_subject_subset,
+    )
+
+    selected_ckpt = get_loaded_ckpt()
+    recon_result = None  # cached dict {orig, recon, subjs, ...} once available
+
+    _device = default_device()
+    _n_test_total = len(fit_normalisation_stats(n_subjs=500)["test_subjs"]) if selected_ckpt else 0
+    _frac = recon_fraction.value / 100.0
+    _n_subj_req = max(1, round(_frac * _n_test_total))
+    _eta_s = _n_subj_req * estimate_seconds_per_subject(_device)
+    _eta_txt = f"~{_eta_s:.0f} s" if _eta_s < 120 else f"~{_eta_s / 60:.1f} min"
+
+    _title = mo.md("### 🧠 DAPT Reconstruction")
+    if selected_ckpt is None:
+        recon_header = mo.vstack([
+            _title,
+            mo.md(
+                "*Select a DAPT run with a saved checkpoint and click **Load & Visualize History** "
+                "to inspect its BOLD reconstructions.*"
+            ),
+        ])
+    else:
+        _key = (selected_ckpt, str(_device), recon_fraction.value)
+        _cache = get_recon_cache()
+        if recon_run_btn.value and _key not in _cache:
+            _stats = fit_normalisation_stats(n_subjs=500)
+            _subjs = select_test_subject_subset(_stats["test_subjs"], frac=_frac, seed=0)
+            with mo.status.progress_bar(
+                total=len(_subjs),
+                title="Reconstructing BOLD",
+                subtitle=f"{len(_subjs)} subjects on {_device.type.upper()} (est. {_eta_txt})",
+                completion_title="Reconstruction complete",
+                completion_subtitle=f"{len(_subjs)} subjects",
+            ) as _bar:
+                _res = reconstruct_subjects(
+                    selected_ckpt, _subjs, _stats["W"], _stats["B"],
+                    device=_device,
+                    progress=lambda done, total: _bar.update(),
+                )
+            _res["fraction"] = recon_fraction.value
+            set_recon_cache({**_cache, _key: _res})
+            _cache = get_recon_cache()
+
+        recon_result = _cache.get(_key)
+        if recon_result is None:
+            _status = mo.md(
+                f"👉 *Click **Reconstruct BOLD** to run the model on {recon_fraction.value}% of the "
+                f"held-out test subjects ({_n_subj_req} subjects, est. {_eta_txt}).*"
+            )
+        else:
+            _status = mo.md(
+                f"✅ Reconstruction cached: **{recon_result['orig'].shape[0]}** samples from "
+                f"**{len(set(recon_result['subjs'].tolist()))}** subjects "
+                f"({recon_fraction.value}% of {_n_test_total} test subjects)."
+            )
+        recon_header = mo.vstack([
+            _title,
+            mo.hstack([recon_fraction, recon_run_btn], justify="start", wrap=True),
+            mo.md(
+                f"Device: **{_device.type.upper()}** · selection: **{recon_fraction.value}%** = "
+                f"**{_n_subj_req}** of {_n_test_total} test subjects · estimated time **{_eta_txt}**"
+            ),
+            _status,
+        ])
+    recon_header
+    return (recon_result,)
+
+
+@app.cell
+def _(fig_to_png, mo, recon_plot_width, recon_result):
+    # ── Overall reconstruction statistics (all samples / subjects) ───────────
+    mo.stop(recon_result is None)
+
+    import numpy as _np
+    from OCD_symphony.data_validation.validate_preprocessing import (
+        compute_r2, compute_roi_correlation, plot_recon_summary,
+    )
+
+    # Heavy results are memoised inside the cached dict so changing plot width
+    # or the trace controls below never recomputes them.
+    if "r2" not in recon_result:
+        recon_result["r2"] = compute_r2(recon_result["orig"], recon_result["recon"])
+        recon_result["corr"] = compute_roi_correlation(recon_result["orig"], recon_result["recon"])
+    recon_r2 = recon_result["r2"]
+    _corr = recon_result["corr"]
+    if "summary_png" not in recon_result:
+        recon_result["summary_png"] = fig_to_png(
+            plot_recon_summary(
+                recon_result["orig"], recon_result["recon"], recon_result["subjs"],
+                r2=recon_r2, corr=_corr,
+            )
+        )
+
+    _n_samples = recon_result["orig"].shape[0]
+    _n_subj = len(set(recon_result["subjs"].tolist()))
+    _cards = mo.hstack([
+        mo.stat(label="Mean ROI R²", value=f"{recon_r2.mean():.3f}", caption=f"Median {_np.median(recon_r2):.3f}"),
+        mo.stat(
+            label="ROIs with R² > 0",
+            value=f"{100 * (recon_r2 > 0).mean():.1f}%",
+            caption=f"{int((recon_r2 > 0).sum())} / {recon_r2.size} ROIs",
+        ),
+        mo.stat(
+            label="Mean Pearson R",
+            value=f"{_np.nanmean(_corr):.3f}",
+            caption="Over samples × ROIs (time-wise)",
+        ),
+        mo.stat(label="Samples", value=f"{_n_samples}", caption=f"{_n_subj} subjects"),
+    ], justify="space-around")
+
+    summary_view = mo.vstack([
+        mo.md("#### 📊 Overall reconstruction statistics"),
+        _cards,
+        mo.image(recon_result["summary_png"], width=recon_plot_width.value),
+    ])
+    summary_view
+    return (recon_r2,)
+
+
+@app.cell
+def _(
+    fig_to_png,
+    mo,
+    recon_n_rois,
+    recon_plot_width,
+    recon_r2,
+    recon_result,
+    recon_roi_strategy,
+    recon_subject_idx,
+    recon_t_window,
+):
+    # ── Single-sample BOLD trace viewer ───────────────────────────────────────
+    mo.stop(recon_result is None)
+
+    from OCD_symphony.data_validation.validate_preprocessing import (
+        plot_recon_timeseries, select_rois_for_display,
+    )
+
+    _n = recon_result["orig"].shape[0]
+    _i = min(int(recon_subject_idx.value), _n - 1)
+    _rois = select_rois_for_display(recon_r2, n_rois=recon_n_rois.value, strategy=recon_roi_strategy.value)
+    _t0, _t1 = recon_t_window.value
+    _png = fig_to_png(
+        plot_recon_timeseries(
+            recon_result["orig"], recon_result["recon"], sample_idx=_i,
+            roi_indices=_rois, t_window=(_t0, _t1),
+        )
+    )
+    trace_view = mo.vstack([
+        mo.md("#### 🧬 BOLD traces (single sample)"),
+        mo.hstack([recon_roi_strategy, recon_n_rois, recon_t_window], justify="start", wrap=True),
+        mo.hstack([recon_subject_idx, recon_plot_width], justify="start", wrap=True),
+        mo.md(
+            f"Subject `{recon_result['subjs'][_i]}` (sample {_i + 1}/{_n}) · "
+            f"mean ROI-wise R² over the split: **{recon_r2.mean():.3f}** · "
+            f"panel titles show per-trace Pearson r."
+        ),
+        mo.image(_png, width=recon_plot_width.value),
+    ])
+    trace_view
     return
 
 
