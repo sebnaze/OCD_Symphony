@@ -119,22 +119,21 @@ def plot_recon_histogram(original_data, recon_data, subjs):
     return fig
 
 
-def plot_recon_summary(orig, recon, subjs, r2=None, corr=None, figsize=(9, 6.5)):
+def plot_recon_summary(r2, corr, subjs, figsize=(9, 6.5)):
     """ Compact overview of reconstruction quality over all samples. Returns the Figure.
+
+    Inputs are precomputed statistics: ``r2`` (R,) ROI-wise R², ``corr`` (N, R)
+    per-sample ROI-wise Pearson r, ``subjs`` (N,) subject id per sample.
 
     Panels: (a) histogram of ROI-wise R², (b) mean R² per resting-state network,
     (c) KDE of per-ROI Pearson R by network, (d) KDE of Pearson R per subject,
     (e) ROI-wise R² for every ROI ordered by network (bars coloured by network).
-    ``r2`` (R,) and ``corr`` (N, R) may be passed in to avoid recomputation.
     """
     rs_nets, _ = load_RSNs()
     rs_nets = np.asarray(rs_nets)
     subjs = np.asarray(subjs)
-    if r2 is None:
-        r2 = compute_r2(orig, recon)
-    if corr is None:
-        corr = compute_roi_correlation(orig, recon)
     r2 = np.asarray(r2)
+    corr = np.asarray(corr)
     n_samples, n_rois = corr.shape
 
     df_r2 = pd.DataFrame({'r2': r2, 'network': rs_nets, 'roi_idx': np.arange(n_rois)})

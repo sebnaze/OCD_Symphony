@@ -10,9 +10,10 @@ Speed
   (see ``make_hcp_dataset_from_pt``). Re-fitting on a subset would change the model
   inputs, so W and B are fitted once and cached in ``results/``.
 * Only the selected subjects' raw files are read.
-* Inference runs on the GPU when available, and the built models are cached per
-  checkpoint/device so repeated requests do not rebuild them.
+* Inference runs on the GPU when available. Models are built per request and released
+  (VRAM returned) before the request returns.
 """
+import gc
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ from OCD_symphony.data_preparation.make_hcp_dataset import (
     make_hcp_dataset_from_pt,
     subject_train_val_test_split,
 )
+from OCD_symphony.data_validation.validate_preprocessing import compute_roi_correlation
 from OCD_symphony.model.finetuning import build_pretrained_models
 
 DATA_DIR = os.path.join(proj_dir, "data", "hcp")
@@ -99,21 +101,20 @@ def select_test_subject_subset(test_subjs, frac: float = 0.10, seed: int = 0) ->
     return sorted(str(s) for s in test_subjs[order[:k]])
 
 
-_MODEL_CACHE: Dict[tuple, tuple] = {}
-
-
 def get_dapt_models(ckpt_path: str, device: torch.device):
-    """Build the four DAPT modules once per (checkpoint, device) and reuse them."""
-    key = (os.path.abspath(ckpt_path), str(device))
-    if key not in _MODEL_CACHE:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        models = build_pretrained_models(
-            args=None, device=device, mask_ratio=0.0, encoder_ckpt=ckpt,
-        )
-        for m in models:
-            m.eval()
-        _MODEL_CACHE[key] = models
-    return _MODEL_CACHE[key]
+    """Build the four DAPT modules (eval mode) for one checkpoint.
+
+    Not cached: the caller owns the returned models and must release them with
+    ``release_gpu_memory()`` once inference is finished.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    models = build_pretrained_models(
+        args=None, device=device, mask_ratio=0.0, encoder_ckpt=ckpt,
+    )
+    for m in models:
+        m.eval()
+    return models
+
 
 
 def default_device() -> torch.device:
@@ -152,51 +153,156 @@ def estimate_seconds_per_subject(device: torch.device) -> float:
     return 0.3 if device.type == "cuda" else 4.5
 
 
+def select_representative_subjects(scores: Dict[str, float], k: int = 6) -> List[str]:
+    """Pick ``k`` subjects: best (highest score), worst (lowest), and the remaining
+    ``k - 2`` closest to the median score (ties broken by subject id).
+
+    Subjects with a non-finite score are ignored. If there are at most ``k`` valid
+    subjects, all of them are returned (best first).
+    """
+    if k < 2:
+        raise ValueError("k must be >= 2 (best and worst subject)")
+    valid = sorted(((s, float(v)) for s, v in scores.items() if np.isfinite(v)), key=lambda x: x[0])
+    if len(valid) <= k:
+        return [s for s, _ in sorted(valid, key=lambda x: -x[1])]
+    best = max(valid, key=lambda x: x[1])
+    worst = min(valid, key=lambda x: x[1])
+    median = float(np.median([v for _, v in valid]))
+    rest = [x for x in valid if x[0] not in (best[0], worst[0])]
+    rest.sort(key=lambda x: (abs(x[1] - median), x[0]))
+    middle = [s for s, _ in rest[: k - 2]]
+    return [best[0]] + middle + [worst[0]]
+
+
+def release_gpu_memory() -> None:
+    """Drop Python references and return cached CUDA blocks to the driver."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, device):
+    """Yield ``(orig, recon)`` numpy batches (n, R, T) for one subject, masking off."""
+    spatial_model, temporal_model, conv_model, perceiver = models
+    ds = load_subjects_normalised([sid], W, B, max_abs=max_abs)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    for fmri, fc, gm, _label in loader:
+        fmri = fmri.to(device, non_blocking=True).float()
+        fc = fc.to(device, non_blocking=True).float()
+        gm = gm.to(device, non_blocking=True).float()
+        _, _, _, _, roi_embeds, roi_pos = spatial_model(gm, fmri, fc)
+        _, _, _, _, time_embeds, _ = temporal_model(fmri)
+        _, signal_context = conv_model(fmri, mask=None)
+        recon, _, _ = perceiver(roi_embeds, time_embeds, signal_context, roi_pos)
+        yield fmri.cpu().numpy(), recon.cpu().numpy()
+
+
+def _add_r2_sums(sums, orig, recon):
+    """Accumulate per-ROI running sums (count, sum y, sum y², SS_res) for a (n, R, T) batch."""
+    o = np.asarray(orig, dtype=np.float64)
+    r = np.asarray(recon, dtype=np.float64)
+    part = np.stack([
+        np.full(o.shape[1], o.shape[0] * o.shape[2], dtype=np.float64),
+        o.sum(axis=(0, 2)),
+        (o ** 2).sum(axis=(0, 2)),
+        ((o - r) ** 2).sum(axis=(0, 2)),
+    ])
+    return part if sums is None else sums + part
+
+
+def _r2_from_sums(sums) -> np.ndarray:
+    """ROI-wise R² = 1 - SS_res / SS_tot, identical to ``compute_r2`` over all samples/time."""
+    counts, sum_o, sum_o2, ss_res = sums
+    ss_tot = sum_o2 - sum_o ** 2 / counts
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return 1.0 - ss_res / ss_tot
+
+
 @torch.no_grad()
-def reconstruct_subjects(
+def reconstruct_subject_stats(
     ckpt_path: str,
     subject_ids: List[str],
     W,
     B,
+    keep_k: int = 6,
     max_abs: float = 1e4,
     batch_size: int = 16,
     device: Optional[torch.device] = None,
     progress: Optional[Callable[[int, int], None]] = None,
-) -> Dict[str, np.ndarray]:
-    """Reconstruct BOLD for ``subject_ids`` with the DAPT checkpoint (masking off).
+) -> Dict[str, object]:
+    """Reconstruct ``subject_ids`` and return aggregate statistics plus traces for a
+    small set of representative subjects. The GPU models are released before returning.
 
-    Subjects are read in chunks of one subject each; ``progress(done, total)`` is
-    called after every subject so the UI can show a progress bar.
-    Returns ``orig`` (N, R, T), ``recon`` (N, R, T) and ``subjs`` (N,).
+    Pass 1 streams every subject once: per-sample ROI-wise Pearson r is kept (small),
+    ROI-wise R² is accumulated from running sums (the full BOLD arrays are never held),
+    and a per-subject score (mean r over ROIs and time) is recorded.
+    Pass 2 re-runs inference for only the ``keep_k`` representative subjects to keep
+    their full original/reconstructed traces (chosen after pass 1, so the median is known).
+
+    Returns a dict with:
+      r2 (R,), corr (N, R), subjs (N,) — over all reconstructed samples;
+      subject_scores {subj: score}; representative (list, best first, worst last);
+      traces {subj: {"orig": (n, R, T), "recon": (n, R, T)}}.
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"DAPT checkpoint not found: {ckpt_path}")
     device = device or default_device()
-    spatial_model, temporal_model, conv_model, perceiver = get_dapt_models(ckpt_path, device)
+    models = get_dapt_models(ckpt_path, device)
+    try:
+        total = len(subject_ids)
+        n_roi = None
+        sums = None  # per-ROI running sums in float64
+        corr_rows, subjs_rows = [], []
+        subject_scores: Dict[str, float] = {}
+        n_t = None
+        n_done = 0
 
-    origs, recons, subjs = [], [], []
-    total = len(subject_ids)
-    for done, sid in enumerate(subject_ids, start=1):
-        ds = load_subjects_normalised([sid], W, B, max_abs=max_abs)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
-        for fmri, fc, gm, _label in loader:
-            fmri = fmri.to(device, non_blocking=True).float()
-            fc = fc.to(device, non_blocking=True).float()
-            gm = gm.to(device, non_blocking=True).float()
-            _, _, _, _, roi_embeds, roi_pos = spatial_model(gm, fmri, fc)
-            _, _, _, _, time_embeds, _ = temporal_model(fmri)
-            _, signal_context = conv_model(fmri, mask=None)
-            recon, _, _ = perceiver(roi_embeds, time_embeds, signal_context, roi_pos)
-            origs.append(fmri.cpu().numpy())
-            recons.append(recon.cpu().numpy())
-        subjs.extend(ds.subjs.tolist())
-        if progress is not None:
-            progress(done, total)
+        # ── Pass 1: stream all subjects ─────────────────────────────────────
+        for sid in subject_ids:
+            sid_corr = []
+            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device):
+                n_roi = o.shape[1]
+                n_t = o.shape[2]
+                sums = _add_r2_sums(sums, o, r)
+                sid_corr.append(compute_roi_correlation(o, r))
+                subjs_rows.extend([sid] * o.shape[0])
+            if sid_corr:
+                corr_all = np.concatenate(sid_corr, axis=0)
+                corr_rows.append(corr_all)
+                finite = corr_all[np.isfinite(corr_all)]
+                subject_scores[sid] = float(finite.mean()) if finite.size else float("nan")
+            n_done += 1
+            if progress is not None:
+                progress(n_done, total + keep_k)
 
-    if not origs:
-        raise RuntimeError("No subject could be reconstructed.")
-    return {
-        "orig": np.concatenate(origs, axis=0),
-        "recon": np.concatenate(recons, axis=0),
-        "subjs": np.asarray(subjs),
-    }
+        if not corr_rows:
+            raise RuntimeError("No subject could be reconstructed.")
+
+        r2 = _r2_from_sums(sums)
+
+        # ── Pass 2: traces for representative subjects only ─────────────────
+        representative = select_representative_subjects(subject_scores, k=keep_k)
+        traces: Dict[str, Dict[str, np.ndarray]] = {}
+        for sid in representative:
+            o_list, r_list = [], []
+            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device):
+                o_list.append(o)
+                r_list.append(r)
+            traces[sid] = {"orig": np.concatenate(o_list, axis=0),
+                           "recon": np.concatenate(r_list, axis=0)}
+            n_done += 1
+            if progress is not None:
+                progress(n_done, total + keep_k)
+
+        return {
+            "r2": r2,
+            "corr": np.concatenate(corr_rows, axis=0),
+            "subjs": np.asarray(subjs_rows),
+            "subject_scores": subject_scores,
+            "representative": representative,
+            "traces": traces,
+            "n_timepoints": n_t,
+        }
+    finally:
+        del models
+        release_gpu_memory()

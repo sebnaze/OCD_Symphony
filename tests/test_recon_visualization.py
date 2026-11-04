@@ -109,16 +109,47 @@ def test_plot_histogram_and_barplot_return_figures():
 def test_plot_recon_summary_returns_compact_figure():
     orig, recon = _make_pair(N=4, R=450, T=200)
     subjs = np.array(["a", "a", "b", "c"])
-    fig = plot_recon_summary(orig, recon, subjs)
+    fig = plot_recon_summary(
+        compute_r2(orig, recon), compute_roi_correlation(orig, recon), subjs
+    )
     assert isinstance(fig, plt.Figure)
     assert len(fig.axes) == 5
     assert fig.get_size_inches()[0] <= 10
     plt.close(fig)
-    fig2 = plot_recon_summary(
-        orig, recon, subjs, r2=compute_r2(orig, recon), corr=compute_roi_correlation(orig, recon)
-    )
-    assert len(fig2.axes) == 5
-    plt.close(fig2)
+
+
+def test_streaming_r2_matches_compute_r2():
+    from OCD_symphony.reconstruction.dapt_reconstruction import _add_r2_sums, _r2_from_sums
+
+    orig, recon = _make_pair(N=5, R=7, T=30)
+    o, r = orig.numpy(), recon.numpy()
+    sums = None
+    for i in range(0, 5, 2):  # batches of samples, as produced per subject
+        sums = _add_r2_sums(sums, o[i:i + 2], r[i:i + 2])
+    assert np.allclose(_r2_from_sums(sums), compute_r2(orig, recon), atol=1e-10)
+
+
+def test_select_representative_subjects_best_worst_and_median():
+    from OCD_symphony.reconstruction.dapt_reconstruction import select_representative_subjects
+
+    scores = {f"s{i:02d}": i / 100 for i in range(20)}
+    scores["s99"] = float("nan")  # ignored
+    sel = select_representative_subjects(scores, k=6)
+    assert len(sel) == len(set(sel)) == 6
+    assert sel[0] == "s19" and sel[-1] == "s00"  # best first, worst last
+    assert "s99" not in sel
+    middle = sel[1:-1]
+    assert all(abs(scores[s] - 0.095) <= 0.06 for s in middle)  # near median 0.095
+    # fewer valid subjects than k -> all returned, best first
+    small = select_representative_subjects({"a": 0.1, "b": 0.5, "c": float("nan")}, k=6)
+    assert small == ["b", "a"]
+
+
+def test_reconstruct_subject_stats_missing_checkpoint_raises():
+    from OCD_symphony.reconstruction.dapt_reconstruction import reconstruct_subject_stats
+
+    with pytest.raises(FileNotFoundError):
+        reconstruct_subject_stats("/nonexistent/ckpt.pth", ["100001"], np.ones(450), np.zeros(450))
 
 
 def test_subject_subset_is_nested_and_reproducible():
