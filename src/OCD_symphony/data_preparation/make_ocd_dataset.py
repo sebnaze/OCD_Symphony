@@ -132,6 +132,22 @@ def identity_collate(batch):
     return torch.utils.data._utils.collate.default_collate(batch)
 
 
+def make_ocd_dataset_from_pt(label: str, n_subjs=None, max_abs: float = 1e4, **kwargs):
+    """Load the OCD cohort in the same FMRIDataset format used for HCP-YA training.
+
+    Subjects, age, gender and condition (OCD / HC) come from data/demographics.csv.
+    Labels: 'condition', 'gender', 'age'. Scope is always all subjects (n_subjs=None),
+    so the caller should not expose a subject-count choice for this dataset.
+    """
+    from OCD_symphony.data_preparation.make_hcp_dataset import (
+        DATASET_DIRS, make_hcp_dataset_from_pt,
+    )
+    return make_hcp_dataset_from_pt(
+        path=DATASET_DIRS["ocd"], label=label, n_subjs=n_subjs,
+        max_abs=max_abs, dataset="ocd", **kwargs,
+    )
+
+
 if __name__ == "__main__":
     # Example usage (adjust path and keys):
     d = make_dataset_from_pt(os.path.join(proj_dir, 'data'))

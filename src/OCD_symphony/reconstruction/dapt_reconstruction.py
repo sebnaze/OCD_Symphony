@@ -26,6 +26,8 @@ from torch.utils.data import DataLoader
 
 from OCD_symphony.utils import proj_dir
 from OCD_symphony.data_preparation.make_hcp_dataset import (
+    DATASET_DIRS,
+    WINDOW_DEMEAN_DATASETS,
     FMRIDataset,
     _load_raw_file,
     make_hcp_dataset_from_pt,
@@ -34,8 +36,12 @@ from OCD_symphony.data_preparation.make_hcp_dataset import (
 from OCD_symphony.data_validation.validate_preprocessing import compute_roi_correlation
 from OCD_symphony.model.finetuning import build_pretrained_models
 
-DATA_DIR = os.path.join(proj_dir, "data", "hcp")
+DATA_DIR = DATASET_DIRS["hcp_ya"]  # kept for backward compatibility
 RESULTS_DIR = os.path.join(proj_dir, "results")
+
+# Subject-level split label per dataset. It stratifies the held-out test subjects, so it is
+# fixed here and does not depend on the target chosen for training.
+RECON_SPLIT_LABEL = {"hcp_ya": "gender", "ocd": "condition"}
 
 # ROI reindexing used by make_hcp_dataset (order: sub-ctx_R, sub-ctx_L, ctx_L, ctx_R)
 _ROI_INDS = torch.from_numpy(np.concatenate([
@@ -44,11 +50,19 @@ _ROI_INDS = torch.from_numpy(np.concatenate([
 
 
 def _cache_key(n_subjs: Optional[int], max_abs: float, test_frac: float,
-               val_frac: float, seed: int) -> str:
-    """Stable key for cached files; any change of data/split args gives a new key."""
+               val_frac: float, seed: int, dataset: str = "hcp_ya") -> str:
+    """Stable key for cached files; any change of data/split args gives a new key.
+
+    HCP-YA keeps the legacy key format so existing caches stay valid.
+    """
     cfg = dict(n_subjs=n_subjs, max_abs=max_abs, test_frac=test_frac, val_frac=val_frac, seed=seed)
+    if dataset != "hcp_ya":
+        cfg["dataset"] = dataset
+        # Bumped whenever the preprocessing changes, so stale statistics are never reused.
+        cfg["preprocess"] = "window_demean_v1" if dataset in WINDOW_DEMEAN_DATASETS else "none"
     digest = hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
-    return f"n{n_subjs}_seed{seed}_{digest}"
+    prefix = "" if dataset == "hcp_ya" else f"{dataset}_"
+    return f"{prefix}n{n_subjs}_seed{seed}_{digest}"
 
 
 def fit_normalisation_stats(
@@ -58,29 +72,36 @@ def fit_normalisation_stats(
     val_frac: float = 0.15,
     seed: int = 42,
     cache: bool = True,
+    dataset: str = "hcp_ya",
 ) -> Dict[str, np.ndarray]:
-    """Return ``{"W", "B", "test_subjs"}`` for the DAPT data configuration.
+    """Return ``{"W", "B", "test_subjs"}`` for the reconstruction data configuration.
+
+    ``dataset`` is 'hcp_ya' or 'ocd'. The OCD cohort always uses all subjects, so W,B are
+    fitted on the whole cohort and the test subjects come from the OCD split.
 
     The first call loads the full dataset once (~5 min) to fit the global
     per-ROI normalisation and the held-out test subject list, then caches them in
     ``results/``. Later calls read the cache in milliseconds.
     """
-    key = _cache_key(n_subjs, max_abs, test_frac, val_frac, seed)
+    if dataset == "ocd":
+        n_subjs = None
+    key = _cache_key(n_subjs, max_abs, test_frac, val_frac, seed, dataset)
     path = os.path.join(RESULTS_DIR, f"dapt_recon_stats_{key}.npz")
     if cache and os.path.isfile(path):
         d = np.load(path, allow_pickle=False)
         return {"W": d["W"], "B": d["B"], "test_subjs": d["test_subjs"]}
 
-    dataset, _ = make_hcp_dataset_from_pt(
-        path=DATA_DIR, label="gender", n_subjs=n_subjs, max_abs=max_abs,
+    dataset_obj, _ = make_hcp_dataset_from_pt(
+        path=DATASET_DIRS[dataset], label=RECON_SPLIT_LABEL[dataset], n_subjs=n_subjs,
+        max_abs=max_abs, dataset=dataset,
     )
     _, _, testset = subject_train_val_test_split(
-        dataset, test_frac=test_frac, val_frac=val_frac, seed=seed,
+        dataset_obj, test_frac=test_frac, val_frac=val_frac, seed=seed,
     )
-    test_subjs = sorted(set(np.asarray(dataset.subjs)[np.asarray(testset.indices)].tolist()))
+    test_subjs = sorted(set(np.asarray(dataset_obj.subjs)[np.asarray(testset.indices)].tolist()))
     stats = {
-        "W": dataset.norm_W.numpy(),
-        "B": dataset.norm_B.numpy(),
+        "W": dataset_obj.norm_W.numpy(),
+        "B": dataset_obj.norm_B.numpy(),
         "test_subjs": np.array(test_subjs),
     }
     if cache:
@@ -101,13 +122,118 @@ def select_test_subject_subset(test_subjs, frac: float = 0.10, seed: int = 0) ->
     return sorted(str(s) for s in test_subjs[order[:k]])
 
 
-def get_dapt_models(ckpt_path: str, device: torch.device):
-    """Build the four DAPT modules (eval mode) for one checkpoint.
+_ENCODER_SECTIONS = ("spatial", "temporal", "conv")
+_DAPT_SECTIONS = _ENCODER_SECTIONS + ("perceiver",)
+
+
+class MissingEncoderError(ValueError):
+    """The run cannot be reconstructed because its encoder weights are not available."""
+
+
+def _find_run_config(ckpt_path: str) -> Optional[dict]:
+    """Return the ``config`` of the results/runs JSON whose ``history.ckpt_path`` is ``ckpt_path``.
+
+    Used for checkpoints saved before the run recorded its own DAPT source. Matches on
+    basename so that a moved project directory still resolves.
+    """
+    runs_dir = os.path.join(RESULTS_DIR, "runs")
+    if not os.path.isdir(runs_dir):
+        return None
+    target = os.path.basename(ckpt_path)
+    for name in sorted(os.listdir(runs_dir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(runs_dir, name)) as f:
+                run = json.load(f)
+        except (OSError, ValueError):
+            continue
+        saved = (run.get("history") or {}).get("ckpt_path")
+        if saved and os.path.basename(saved) == target:
+            meta = run.get("meta") or {}
+            return meta.get("config") or run.get("config") or {}
+    return None
+
+
+def load_reconstruction_checkpoint(ckpt_path: str, device: torch.device):
+    """Return ``(encoder_ckpt, description)`` for ``build_pretrained_models``.
+
+    Accepted inputs:
+
+    * **DAPT checkpoint** (Stage 3.1): contains ``spatial``, ``temporal``, ``conv``
+      and ``perceiver`` sections. Used as-is.
+    * **Classifier checkpoint with stored encoders** (Stage 3.2 with ``encoder_lr > 0``):
+      contains the same DAPT-format sections next to the flat classifier keys.
+    * **Classifier checkpoint without encoders** (Stage 3.2 with ``encoder_lr == 0``):
+      the encoders are the frozen DAPT encoders. Their source is the ``dapt_ckpt`` of the
+      run, read from the checkpoint or the run JSON. The Perceiver comes from this file.
+
+    Raises ``ValueError`` with an explicit message for anything else.
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{ckpt_path}: expected a dict checkpoint, got {type(raw).__name__}.")
+
+    # Case 1 and 2: DAPT-format sections present.
+    if all(isinstance(raw.get(s), dict) for s in _DAPT_SECTIONS):
+        kind = "DAPT checkpoint" if "encoder_lr" not in raw else "Stage 3.2 checkpoint (encoders stored)"
+        return {s: raw[s] for s in _DAPT_SECTIONS}, f"{kind}: {os.path.basename(ckpt_path)}"
+
+    # Case 3: flat classifier checkpoint.
+    perceiver_prefix = "perceiver."
+    perceiver_state = {k[len(perceiver_prefix):]: v for k, v in raw.items()
+                       if isinstance(k, str) and k.startswith(perceiver_prefix)}
+    if not perceiver_state:
+        raise ValueError(
+            f"{ckpt_path}: unrecognised checkpoint. Expected DAPT sections "
+            f"{_DAPT_SECTIONS} or classifier 'perceiver.*' keys."
+        )
+
+    run_cfg = raw.get("config") if isinstance(raw.get("config"), dict) else None
+    if run_cfg is None:
+        run_cfg = _find_run_config(ckpt_path) or {}
+    encoder_lr = float(run_cfg.get("encoder_lr", 0.0) or 0.0)
+    if encoder_lr > 0.0:
+        raise MissingEncoderError(
+            f"{ckpt_path}: Stage 3.2 run used encoder_lr={encoder_lr:g} but its fine-tuned "
+            "encoders were not saved. Re-run Stage 3.2 with the current code to reconstruct it."
+        )
+
+    dapt_path = raw.get("dapt_ckpt") or run_cfg.get("dapt_ckpt")
+    if not dapt_path:
+        raise MissingEncoderError(
+            f"{ckpt_path}: no DAPT encoder source found (checked the checkpoint and its run JSON)."
+        )
+    if not os.path.isfile(dapt_path):
+        raise MissingEncoderError(f"DAPT encoder checkpoint referenced by run not found: {dapt_path}")
+
+    dapt = torch.load(dapt_path, map_location=device, weights_only=False)
+    missing = [s for s in _DAPT_SECTIONS if not isinstance(dapt.get(s), dict)]
+    if missing:
+        raise ValueError(f"{dapt_path}: not a DAPT checkpoint, missing sections {missing}.")
+
+    encoder_ckpt = {s: dapt[s] for s in _ENCODER_SECTIONS}
+    encoder_ckpt["perceiver"] = perceiver_state  # Stage 3.2 Perceiver, not the DAPT one
+    desc = (f"Stage 3.2 classifier {os.path.basename(ckpt_path)} "
+            f"(encoders from DAPT {os.path.basename(dapt_path)})")
+    return encoder_ckpt, desc
+
+
+def get_dapt_models(ckpt_path: Optional[str], device: torch.device):
+    """Build the four modules (eval mode).
+
+    ``ckpt_path`` is a DAPT or Stage 3.2 checkpoint (see ``load_reconstruction_checkpoint``),
+    or ``None`` for the baseline: the original HCP-AGING pretrained weights loaded by
+    ``build_pretrained_models``.
 
     Not cached: the caller owns the returned models and must release them with
     ``release_gpu_memory()`` once inference is finished.
     """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = None
+    if ckpt_path is not None:
+        ckpt, _ = load_reconstruction_checkpoint(ckpt_path, device)
     models = build_pretrained_models(
         args=None, device=device, mask_ratio=0.0, encoder_ckpt=ckpt,
     )
@@ -122,14 +248,15 @@ def default_device() -> torch.device:
 
 
 def load_subjects_normalised(subject_ids: List[str], W, B, max_abs: float = 1e4,
-                             num_io_workers: int = 8) -> FMRIDataset:
-    """Read only ``subject_ids``, reindex ROIs and apply the global (W, B).
+                             num_io_workers: int = 8, dataset: str = "hcp_ya") -> FMRIDataset:
+    """Read only ``subject_ids`` from ``dataset``, reindex ROIs and apply the global (W, B).
 
     Same transform as ``make_hcp_dataset_from_pt`` steps 3-6, so inputs match training.
     """
-    fnames = [os.path.join(DATA_DIR, f"{s}.pt") for s in subject_ids]
+    data_dir = DATASET_DIRS[dataset]
+    fnames = [os.path.join(data_dir, f"{s}.pt") for s in subject_ids]
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
-        records = list(ex.map(lambda f: _load_raw_file(f, max_abs), fnames))
+        records = list(ex.map(lambda f: _load_raw_file(f, max_abs, dataset), fnames))
     records = sorted((r for r in records if not r.get("excluded")), key=lambda r: r["subj"])
     if not records:
         raise RuntimeError("None of the selected subjects passed validation.")
@@ -143,8 +270,13 @@ def load_subjects_normalised(subject_ids: List[str], W, B, max_abs: float = 1e4,
     subjs = np.concatenate([[r["subj"]] * r["n"] for r in records])
     ages = np.concatenate([[r["age"]] * r["n"] for r in records])
     genders = np.concatenate([[r["gender"]] * r["n"] for r in records])
+    conditions = np.concatenate([[r["condition"]] * r["n"] for r in records])
     G = torch.zeros(fmri.shape[0], 450, 10)  # unused by the learnable spatial PE
-    return FMRIDataset(fmri, fc, G, ages, genders, subjs, "gender")
+    label = RECON_SPLIT_LABEL[dataset] if dataset == "ocd" else "gender"
+    return FMRIDataset(
+        fmri, fc, G, ages, genders, subjs, label,
+        conditions=conditions if dataset == "ocd" else None,
+    )
 
 
 def estimate_seconds_per_subject(device: torch.device) -> float:
@@ -181,10 +313,11 @@ def release_gpu_memory() -> None:
         torch.cuda.empty_cache()
 
 
-def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, device):
+def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, device,
+                     dataset: str = "hcp_ya"):
     """Yield ``(orig, recon)`` numpy batches (n, R, T) for one subject, masking off."""
     spatial_model, temporal_model, conv_model, perceiver = models
-    ds = load_subjects_normalised([sid], W, B, max_abs=max_abs)
+    ds = load_subjects_normalised([sid], W, B, max_abs=max_abs, dataset=dataset)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     for fmri, fc, gm, _label in loader:
         fmri = fmri.to(device, non_blocking=True).float()
@@ -220,7 +353,7 @@ def _r2_from_sums(sums) -> np.ndarray:
 
 @torch.no_grad()
 def reconstruct_subject_stats(
-    ckpt_path: str,
+    ckpt_path: Optional[str],
     subject_ids: List[str],
     W,
     B,
@@ -229,6 +362,7 @@ def reconstruct_subject_stats(
     batch_size: int = 16,
     device: Optional[torch.device] = None,
     progress: Optional[Callable[[int, int], None]] = None,
+    dataset: str = "hcp_ya",
 ) -> Dict[str, object]:
     """Reconstruct ``subject_ids`` and return aggregate statistics plus traces for a
     small set of representative subjects. The GPU models are released before returning.
@@ -244,7 +378,7 @@ def reconstruct_subject_stats(
       subject_scores {subj: score}; representative (list, best first, worst last);
       traces {subj: {"orig": (n, R, T), "recon": (n, R, T)}}.
     """
-    if not os.path.isfile(ckpt_path):
+    if ckpt_path is not None and not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"DAPT checkpoint not found: {ckpt_path}")
     device = device or default_device()
     models = get_dapt_models(ckpt_path, device)
@@ -260,8 +394,7 @@ def reconstruct_subject_stats(
         # ── Pass 1: stream all subjects ─────────────────────────────────────
         for sid in subject_ids:
             sid_corr = []
-            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device):
-                n_roi = o.shape[1]
+            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
                 n_t = o.shape[2]
                 sums = _add_r2_sums(sums, o, r)
                 sid_corr.append(compute_roi_correlation(o, r))
@@ -285,7 +418,7 @@ def reconstruct_subject_stats(
         traces: Dict[str, Dict[str, np.ndarray]] = {}
         for sid in representative:
             o_list, r_list = [], []
-            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device):
+            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
                 o_list.append(o)
                 r_list.append(r)
             traces[sid] = {"orig": np.concatenate(o_list, axis=0),
@@ -302,6 +435,8 @@ def reconstruct_subject_stats(
             "representative": representative,
             "traces": traces,
             "n_timepoints": n_t,
+            "source": "dapt" if ckpt_path is not None else "baseline",
+            "dataset": dataset,
         }
     finally:
         del models

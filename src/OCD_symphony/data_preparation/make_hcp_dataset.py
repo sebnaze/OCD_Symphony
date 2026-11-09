@@ -15,6 +15,7 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from typing import Dict, Generator, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -52,9 +53,96 @@ def load_hcp_age_gender(subjs):
     return hcp_age, hcp_gender
 
 
+# ---------------------------------------------------------------------------
+# Dataset registry and subject metadata
+# ---------------------------------------------------------------------------
+
+HCP_YA_DIR = os.path.join(proj_dir, "data/hcp")
+OCD_DIR = os.path.join(proj_dir, "data/OCDbaseline_fmriprep_MNI152NLin2009cAsym_res-2")
+HCP_DEMOGRAPHICS = os.path.join(proj_dir, "data/HCP_demographic_data.csv")
+OCD_DEMOGRAPHICS = os.path.join(proj_dir, "data/demographics.csv")
+
+# HCP-YA age is only available as bins. Regression uses the bin midpoint. The open-ended
+# "36+" bin has no true midpoint, so 38 is an assumed value.
+HCP_AGE_MIDPOINTS = {"22-25": 23.5, "26-30": 28.0, "31-35": 33.0, "36+": 38.0}
+
+DATASET_DIRS = {"hcp_ya": HCP_YA_DIR, "ocd": OCD_DIR}
+# Datasets whose windows are demeaned per ROI before normalisation (see preprocess_windows).
+WINDOW_DEMEAN_DATASETS = {"ocd"}
+DATASET_TAGS = {"hcp_ya": "HCP_YA", "ocd": "OCD"}
+DATASET_NAMES = {"hcp_ya": "HCP-YA", "ocd": "OCD"}
+# Targets each dataset supports. "age" is a regression target; the others are classes.
+DATASET_LABELS = {
+    "hcp_ya": ("gender", "age"),
+    "ocd": ("condition", "gender", "age"),
+}
 
 
-def _load_raw_file(fname: str, max_abs: float = 1e4) -> Dict:
+@lru_cache(maxsize=None)
+def _demographics_table(dataset: str) -> Dict[str, Dict]:
+    """Map subject id -> {age (float), gender (str), condition (str or None)}."""
+    if dataset == "hcp_ya":
+        df = pd.read_csv(HCP_DEMOGRAPHICS)
+        table = {}
+        for _, row in df.iterrows():
+            bin_ = str(row["Age"]).strip()
+            if bin_ not in HCP_AGE_MIDPOINTS:
+                raise ValueError(f"Unknown HCP age bin {bin_!r} for subject {row['Subject']}")
+            table[str(row["Subject"]).strip()] = dict(
+                age=HCP_AGE_MIDPOINTS[bin_], gender=str(row["Gender"]).strip(), condition=None,
+            )
+        return table
+    if dataset == "ocd":
+        df = pd.read_csv(OCD_DEMOGRAPHICS)
+        cohort_map = {"hc": "HC", "ocd": "OCD"}
+        table = {}
+        for _, row in df.iterrows():
+            cohort = str(row["cohort"]).strip().lower()
+            if cohort not in cohort_map:
+                raise ValueError(f"Unknown cohort {cohort!r} for subject {row['subj']}")
+            table[str(row["subj"]).strip()] = dict(
+                age=float(row["Age"]),
+                gender=str(row["Gender"]).strip().lower(),
+                condition=cohort_map[cohort],
+            )
+        return table
+    raise ValueError(f"Unknown dataset {dataset!r}. Expected one of {sorted(DATASET_DIRS)}.")
+
+
+def load_subject_metadata(dataset: str, subj: str) -> Dict:
+    """Return the demographics of one subject. Raises KeyError if the subject is unknown."""
+    table = _demographics_table(dataset)
+    try:
+        return table[str(subj)]
+    except KeyError:
+        raise KeyError(f"subject {subj!r} not found in {dataset} demographics") from None
+
+
+def check_metadata_coverage(dataset: str, subjs) -> None:
+    """Raise KeyError listing every subject without demographics (fail loudly, never guess)."""
+    table = _demographics_table(dataset)
+    missing = sorted({str(s) for s in subjs if str(s) not in table})
+    if missing:
+        raise KeyError(
+            f"{len(missing)} subject(s) missing from {dataset} demographics: {missing[:20]}"
+        )
+
+
+def preprocess_windows(fmri: torch.Tensor, dataset: str) -> torch.Tensor:
+    """Per-window, per-ROI demeaning for datasets that need it. ``fmri`` is (n, R, T).
+
+    OCD fMRIPrep windows carry large ROI-shared offsets (a common component in
+    the normalised input explains ~37% of the variance; within-window fluctuation
+    is ~20x smaller than on HCP). The HCP-trained model cannot reproduce those
+    offsets, which is why reconstruction correlations collapse. HCP windows are
+    already zero-mean, so HCP is returned unchanged.
+    """
+    if dataset in WINDOW_DEMEAN_DATASETS:
+        return fmri - fmri.mean(dim=2, keepdim=True)
+    return fmri
+
+
+def _load_raw_file(fname: str, max_abs: float = 1e4, dataset: str = "hcp_ya") -> Dict:
     """
     Load one .pt file from disk and return minimally reshaped tensors + metadata.
     No normalisation or ROI reindexing yet – those happen once on the full batch.
@@ -116,7 +204,8 @@ def _load_raw_file(fname: str, max_abs: float = 1e4) -> Dict:
         if n_keep < n:
             fmri, fc = fmri[keep], fc[keep]
 
-        age, gender = load_hcp_age_gender([subj])
+        fmri = preprocess_windows(fmri, dataset)
+        meta = load_subject_metadata(dataset, subj)
         return dict(
             fmri=fmri,
             fc=fc,
@@ -125,8 +214,9 @@ def _load_raw_file(fname: str, max_abs: float = 1e4) -> Dict:
             n_runs_total=n,
             dropped_runs=dropped_runs,
             excluded=False,
-            age=age[0]    if age    else "unknown",
-            gender=gender[0] if gender else "unknown",
+            age=meta["age"],
+            gender=meta["gender"],
+            condition=meta["condition"],
         )
     except Exception as exc:
         print(f"[WARN] Skipping {fname}: {exc}")
@@ -201,24 +291,46 @@ class FMRIDataset(Dataset):
         genders:    np.ndarray,
         subjs:      np.ndarray,
         label:      str,
+        conditions: Optional[np.ndarray] = None,  # OCD vs HC, OCD dataset only
     ) -> None:
         self.fmri_data = fmri_data
         self.fc_data   = fc_data
         self.G_tensor  = G_tensor
         self.subjs     = subjs
         self.label     = label
+        self.targets   = None  # float ages for the regression task
 
         self.label_encoder = LabelEncoder()
-        if label == "age":
-            self.encoded_labels = torch.from_numpy(
-                self.label_encoder.fit_transform(ages)
-            ).long()
-        elif label == "gender":
+        if label == "gender":
+            self.task = "classification"
             self.encoded_labels = torch.from_numpy(
                 self.label_encoder.fit_transform(genders)
             ).long()
+        elif label == "condition":
+            if conditions is None:
+                raise ValueError("label 'condition' needs per-sample conditions (OCD dataset).")
+            self.task = "classification"
+            self.encoded_labels = torch.from_numpy(
+                self.label_encoder.fit_transform(conditions)
+            ).long()
+        elif label == "age":
+            # Regression target: raw age. encoded_labels holds age quartile bins, used only
+            # to stratify subject-level splits (never as the training target).
+            self.task = "regression"
+            ages_f = np.asarray(ages, dtype=np.float64)
+            if not np.isfinite(ages_f).all():
+                raise ValueError("age contains non-finite values.")
+            self.targets = torch.from_numpy(ages_f).float()
+            edges = np.unique(np.quantile(ages_f, [0.25, 0.5, 0.75]))
+            bins = np.digitize(ages_f, edges)
+            self.encoded_labels = torch.from_numpy(
+                self.label_encoder.fit_transform(bins)
+            ).long()
         else:
-            raise ValueError(f"Unknown label: {label!r}. Expected 'age' or 'gender'.")
+            raise ValueError(f"Unknown label: {label!r}. Expected one of gender, condition, age.")
+
+        # What the model receives as the target: class index, or raw age for regression.
+        self.labels_tensor = self.targets if self.task == "regression" else self.encoded_labels
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -229,7 +341,7 @@ class FMRIDataset(Dataset):
             self.fmri_data[idx],
             self.fc_data[idx],
             self.G_tensor[idx],
-            self.encoded_labels[idx],
+            self.labels_tensor[idx],
         )
 
 
@@ -249,6 +361,7 @@ def make_hcp_dataset_from_pt(
     max_abs:     float = 1e4,      # runs with |fMRI| above this are treated as corrupted
     quantile_seed: int = 0,        # seed for the quantile sub-sampling (reproducible stats)
     exclusion_report_path: Optional[str] = None,  # default: results/data_exclusions.json
+    dataset:     str = "hcp_ya",  # "hcp_ya" or "ocd" (selects demographics and labels)
 ) -> Tuple[FMRIDataset, np.ndarray]:
     """
     Build a fully cached FMRIDataset.
@@ -284,6 +397,12 @@ def make_hcp_dataset_from_pt(
         ``<proj_dir>/results/data_exclusions.json``).
     """
 
+    if label not in DATASET_LABELS.get(dataset, ()):
+        raise ValueError(
+            f"label {label!r} is not available for dataset {dataset!r}; "
+            f"choose one of {DATASET_LABELS.get(dataset)}."
+        )
+
     # ── 1. File discovery ────────────────────────────────────────────────────
     fnames = sorted([
         os.path.join(path, f)
@@ -293,11 +412,13 @@ def make_hcp_dataset_from_pt(
     if n_subjs is not None:
         fnames = fnames[start_idx : start_idx + n_subjs]
     print(f"Found {len(fnames)} files to load.")
+    # Every selected subject needs demographics; fail before reading any tensor.
+    check_metadata_coverage(dataset, [os.path.basename(f)[:-3] for f in fnames])
 
     # ── 2. Parallel file load ─────────────────────────────────────────────────
     records: List[Dict] = []
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
-        futures = {ex.submit(_load_raw_file, f, max_abs): f for f in fnames}
+        futures = {ex.submit(_load_raw_file, f, max_abs, dataset): f for f in fnames}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading files"):
             rec = fut.result()
             if rec is not None:
@@ -330,6 +451,7 @@ def make_hcp_dataset_from_pt(
     all_subjs   = np.concatenate([[r["subj"]]   * r["n"] for r in records])
     all_ages    = np.concatenate([[r["age"]]    * r["n"] for r in records])
     all_genders = np.concatenate([[r["gender"]] * r["n"] for r in records])
+    all_conds   = np.concatenate([[r["condition"]] * r["n"] for r in records])
     del records  # free per-file dicts
 
     N = all_fmri.shape[0]
@@ -411,7 +533,11 @@ def make_hcp_dataset_from_pt(
         if hasattr(torch.cuda, "synchronize"):
             torch.cuda.synchronize()
 
-    ds = FMRIDataset(all_fmri, all_fc, all_G, all_ages, all_genders, all_subjs, label)
+    ds = FMRIDataset(
+        all_fmri, all_fc, all_G, all_ages, all_genders, all_subjs, label,
+        conditions=all_conds if dataset == "ocd" else None,
+    )
+    ds.dataset = dataset
     ds.exclusion_report = exclusion_report
     # Per-ROI affine normalisation (x -> W*x + B) fitted on the full dataset; exposed so
     # subsets can be normalised identically without reloading every subject.

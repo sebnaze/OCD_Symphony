@@ -145,6 +145,33 @@ def test_select_representative_subjects_best_worst_and_median():
     assert small == ["b", "a"]
 
 
+def test_baseline_models_load_original_pretrained_weights():
+    import os
+    from OCD_symphony.reconstruction.dapt_reconstruction import get_dapt_models
+    from OCD_symphony.utils import proj_dir
+
+    files = [
+        "temporal_transformer_pretrained_nL6_d128_h4_mlp512.pth",
+        "spatial_transformer_pretrained_learnablePE_nL6_d128_h4_mlp512.pth",
+        "masked_conv1d_temporal_nL6_d128_h4_mlp512.pth",
+        "perceiver_fused_pretrained_nL6_d128_h4_mlp512.pth",
+    ]
+    if not all(os.path.isfile(os.path.join(proj_dir, "models", f)) for f in files):
+        pytest.skip("baseline weight files not present")
+    models = get_dapt_models(None, torch.device("cpu"))
+    assert len(models) == 4
+    assert all(not m.training for m in models)
+
+
+def test_reconstruct_subject_stats_accepts_baseline_none():
+    from OCD_symphony.reconstruction import dapt_reconstruction as d
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(d, "get_dapt_models", lambda ckpt, device: (_ for _ in ()).throw(RuntimeError("sentinel")))
+        with pytest.raises(RuntimeError, match="sentinel"):
+            d.reconstruct_subject_stats(None, ["100001"], np.ones(450), np.zeros(450), device=torch.device("cpu"))
+
+
 def test_reconstruct_subject_stats_missing_checkpoint_raises():
     from OCD_symphony.reconstruction.dapt_reconstruction import reconstruct_subject_stats
 
