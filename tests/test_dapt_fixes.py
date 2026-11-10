@@ -83,6 +83,25 @@ def test_fork_rng_gives_identical_masks_and_preserves_train_stream():
 
 
 # ── Dataset validation ──────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _synthetic_demographics(monkeypatch):
+    """The fixtures write synthetic subject IDs that are not in the demographics files.
+
+    Answer every metadata lookup with a fixed record, so these tests keep exercising the
+    run/subject validation logic. Real lookups still fail loudly for unknown subjects.
+    """
+    import OCD_symphony.data_preparation.make_hcp_dataset as mhd
+
+    class _AnySubject(dict):
+        def __contains__(self, key):
+            return True
+
+        def __missing__(self, key):
+            return dict(age=25.0, gender="M", condition=None)
+
+    monkeypatch.setattr(mhd, "_demographics_table", lambda dataset: _AnySubject())
+
+
 def _write_subject(path, subj, n_runs=3, corrupt_runs=(), nan_fc_runs=(), scale=50.0, seed=0):
     g = torch.Generator().manual_seed(seed)
     fmri = torch.randn(1, n_runs, 450, 200, generator=g) * scale

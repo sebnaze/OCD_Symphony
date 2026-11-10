@@ -20,10 +20,18 @@ def _():
     import importlib
     from types import SimpleNamespace
 
-    # Force a reload so edits to finetuning.py are picked up without restarting
-    # the marimo kernel (Python caches imported modules in sys.modules).
+    # Force a reload so edits to the fine-tuning package are picked up without restarting
+    # the marimo kernel (Python caches imported modules in sys.modules). Dependencies come
+    # first: a module's ``from X import Y`` bindings only refresh when it is reloaded after X.
+    import OCD_symphony.model.constants as _const
+    import OCD_symphony.model.config as _cfg
+    import OCD_symphony.model.metrics as _metrics
+    import OCD_symphony.model.checkpoints as _ckpt
+    import OCD_symphony.model.dapt as _dapt
     import OCD_symphony.model.finetuning as _ft
-    importlib.reload(_ft)
+    import OCD_symphony.model.experiment as _exp
+    for _m in (_const, _cfg, _metrics, _ckpt, _dapt, _ft, _exp):
+        importlib.reload(_m)
 
     from OCD_symphony.model.finetuning import (
         run_single_split,
@@ -579,6 +587,42 @@ def _(
         )
 
         try:
+            import contextlib
+            from OCD_symphony.model.finetuning import format_epoch_summary
+            # Every bar opened for this run lives in _open and is closed in the finally below.
+            _open = contextlib.ExitStack()
+            _bars = {}
+            _n_folds_cv = int(getattr(args, "n_folds", 5)) if is_cv_mode else 1
+            _epoch_total = int(args.n_epochs) * _n_folds_cv
+            if is_dapt:
+                _train_title = "Stage 3.1: DAPT"
+            elif is_cv_mode:
+                _train_title = f"{_n_folds_cv}-Fold Cross-Validation"
+            elif is_fold_mode:
+                _train_title = "Single fold"
+            else:
+                _train_title = f"Training ({mode_selector.value})"
+
+            def _on_load(ev):
+                # Loading bar: one tick per file, shown while the dataset is read.
+                if "load" not in _bars:
+                    _bars["load"] = _open.enter_context(
+                        mo.status.progress_bar(total=ev["total"], title="Loading dataset"))
+                _bars["load"].update(increment=1)
+
+            def _on_epoch(ep, m):
+                # Epoch bar: one tick per finished epoch; subtitle carries the last epoch's metrics.
+                if "epoch" not in _bars:
+                    _bars["epoch"] = _open.enter_context(
+                        mo.status.progress_bar(total=_epoch_total, title=_train_title))
+                fold = m.get("fold")
+                prefix = f"Fold {fold}/{_n_folds_cv} · " if fold is not None else ""
+                epoch_no = m.get("epoch", ep)
+                _bars["epoch"].update(
+                    increment=1,
+                    subtitle=f"{prefix}epoch {epoch_no}/{args.n_epochs} · {format_epoch_summary(m)}",
+                )
+
             if is_probe_mode:
                 spinner_msg = "Fitting logistic-regression probe on frozen latents..."
             elif is_dapt:
@@ -631,15 +675,16 @@ def _(
                         _stack.close()
                 elif is_dapt:
                     # Stage 3.1 is a single reconstruction-pretraining run.
-                    _ckpt_path, history = run_dapt(args)
+                    _ckpt_path, history = run_dapt(args, epoch_callback=_on_epoch, progress=_on_load)
                     test_acc, test_f1 = None, None
                 elif is_cv_mode:
-                    test_acc, test_f1, history = run_cross_validation(args)
+                    test_acc, test_f1, history = run_cross_validation(args, epoch_callback=_on_epoch, progress=_on_load)
                 elif is_fold_mode:
-                    test_acc, test_f1, history = run_single_fold(args)
+                    test_acc, test_f1, history = run_single_fold(args, epoch_callback=_on_epoch, progress=_on_load)
                 else:
-                    test_acc, test_f1, history = run_single_split(args)
+                    test_acc, test_f1, history = run_single_split(args, epoch_callback=_on_epoch, progress=_on_load)
         finally:
+            _open.close()
             clean_gpu_memory()
 
         config = None if is_probe_mode else vars(args)
@@ -1556,7 +1601,21 @@ def _(
     else:
         _ckpt = _dapt_ckpt if _source == "dapt" else None
         _frac = recon_fraction.value / 100.0
-        _stats = fit_normalisation_stats(n_subjs=500, dataset=_ds)
+        # Cold cache: the loading bar opens on the first file event; a warm cache emits nothing.
+        import contextlib as _cl
+        _stats_open = _cl.ExitStack()
+        _stats_bars = {}
+
+        def _on_stats_load(ev):
+            if "load" not in _stats_bars:
+                _stats_bars["load"] = _stats_open.enter_context(
+                    mo.status.progress_bar(total=ev["total"], title="Preparing normalisation statistics"))
+            _stats_bars["load"].update(increment=1)
+
+        try:
+            _stats = fit_normalisation_stats(n_subjs=500, dataset=_ds, progress=_on_stats_load)
+        finally:
+            _stats_open.close()
         _n_test_total = len(_stats["test_subjs"])
         _n_subj_req = max(1, round(_frac * _n_test_total))
         _eta_s = (_n_subj_req + RECON_KEEP_K) * estimate_seconds_per_subject(_device)

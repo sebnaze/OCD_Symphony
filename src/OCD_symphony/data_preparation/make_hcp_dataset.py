@@ -362,6 +362,7 @@ def make_hcp_dataset_from_pt(
     quantile_seed: int = 0,        # seed for the quantile sub-sampling (reproducible stats)
     exclusion_report_path: Optional[str] = None,  # default: results/data_exclusions.json
     dataset:     str = "hcp_ya",  # "hcp_ya" or "ocd" (selects demographics and labels)
+    progress=None,  # optional callback: {"stage": "load", "done", "total"} per file (display only)
 ) -> Tuple[FMRIDataset, np.ndarray]:
     """
     Build a fully cached FMRIDataset.
@@ -419,10 +420,12 @@ def make_hcp_dataset_from_pt(
     records: List[Dict] = []
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
         futures = {ex.submit(_load_raw_file, f, max_abs, dataset): f for f in fnames}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading files"):
+        for done, fut in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Loading files"), start=1):
             rec = fut.result()
             if rec is not None:
                 records.append(rec)
+            if progress is not None:
+                progress({"stage": "load", "done": done, "total": len(futures)})
 
     # Keep deterministic order (as_completed is non-deterministic)
     records.sort(key=lambda r: r["subj"])

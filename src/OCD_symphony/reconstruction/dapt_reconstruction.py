@@ -73,6 +73,7 @@ def fit_normalisation_stats(
     seed: int = 42,
     cache: bool = True,
     dataset: str = "hcp_ya",
+    progress=None,
 ) -> Dict[str, np.ndarray]:
     """Return ``{"W", "B", "test_subjs"}`` for the reconstruction data configuration.
 
@@ -93,7 +94,7 @@ def fit_normalisation_stats(
 
     dataset_obj, _ = make_hcp_dataset_from_pt(
         path=DATASET_DIRS[dataset], label=RECON_SPLIT_LABEL[dataset], n_subjs=n_subjs,
-        max_abs=max_abs, dataset=dataset,
+        max_abs=max_abs, dataset=dataset, progress=progress,
     )
     _, _, testset = subject_train_val_test_split(
         dataset_obj, test_frac=test_frac, val_frac=val_frac, seed=seed,

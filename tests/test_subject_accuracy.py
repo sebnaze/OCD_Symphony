@@ -65,7 +65,7 @@ def test_tie_goes_to_lower_class_index():
 def _fake_dataset(n=10):
     subjs = np.array([f"s{i // 2}" for i in range(n)])        # two samples per subject
     labels = torch.tensor([i % 2 for i in range(n)])
-    return SimpleNamespace(subjs=subjs, encoded_labels=labels)
+    return SimpleNamespace(subjs=subjs, encoded_labels=labels, labels_tensor=labels)
 
 
 def test_subject_mapping_through_nested_subset():
