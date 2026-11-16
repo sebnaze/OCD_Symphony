@@ -21,7 +21,7 @@ from typing import Dict, Generator, Iterator, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from tqdm import tqdm
@@ -348,6 +348,43 @@ class FMRIDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Dataset factory
 # ---------------------------------------------------------------------------
+
+def apply_label_permutation(ds: "FMRIDataset", seed: int) -> dict:
+    """Replace the training target with a subject-level permutation of the real labels.
+
+    One real label per subject (first window) is permuted across all subjects with
+    ``np.random.default_rng(seed)``, and every window of a subject receives its subject's
+    permuted label. Class counts over the cohort are unchanged.
+
+    ``encoded_labels`` is never modified, so stratification and every split stay identical
+    to the real run. For regression, raw ages (``targets``) are permuted and ``labels_tensor``
+    follows them. The real targets are cached on the first call, so repeated calls with
+    different seeds each permute the original labels.
+    """
+    subjs = np.asarray(ds.subjs)
+    uniq, first = np.unique(subjs, return_index=True)
+    is_reg = ds.task == "regression"
+    if is_reg:
+        base = getattr(ds, "_real_targets", None)
+        if base is None:
+            base = ds.targets.clone()
+            ds._real_targets = base
+        real = base.numpy()
+    else:
+        real = ds.encoded_labels.numpy()
+
+    perm = np.random.default_rng(int(seed)).permutation(len(uniq))
+    subj_value = real[first][perm]                  # permuted label per unique subject
+    window_value = subj_value[np.searchsorted(uniq, subjs)]
+
+    if is_reg:
+        ds.targets = torch.from_numpy(window_value).float()
+        ds.labels_tensor = ds.targets
+    else:
+        ds.labels_tensor = torch.from_numpy(window_value).long()
+    ds.label_permutation = {"seed": int(seed), "n_subjects": int(len(uniq))}
+    return ds.label_permutation
+
 
 def make_hcp_dataset_from_pt(
     path:        str,
@@ -792,6 +829,138 @@ def subject_train_val_test_split(
         )
 
     return Subset(ds, train_idx), Subset(ds, val_idx), Subset(ds, test_idx)
+
+
+# ---------------------------------------------------------------------------
+# Split protocol: subject-level (default, valid) vs sample-level (leaky diagnostic)
+# ---------------------------------------------------------------------------
+# "subject": StratifiedGroupKFold with groups=subject. No subject in two partitions.
+# "sample":  StratifiedKFold over windows. Windows of one subject can fall into
+#            train and test. This is the protocol of the preprint; it measures leakage
+#            and must never be reported as a generalisation result.
+
+SPLIT_PROTOCOLS = ("subject", "sample")
+
+
+def _check_protocol(protocol: str) -> None:
+    if protocol not in SPLIT_PROTOCOLS:
+        raise ValueError(f"split protocol must be one of {SPLIT_PROTOCOLS}, got {protocol!r}")
+
+
+def sample_kfold(ds: FMRIDataset, n_splits: int = 5, seed: int = 42) -> List[Tuple[Subset, Subset]]:
+    """Sample-level stratified K-fold: every window is validated exactly once.
+
+    Subjects are NOT kept together, so the same subject can appear in train and val.
+    """
+    n = len(ds)
+    if n_splits > n:
+        raise ValueError(f"n_splits={n_splits} > n_samples={n}. Reduce n_splits.")
+    labels = ds.encoded_labels.numpy()
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return [
+        (Subset(ds, tr.tolist()), Subset(ds, va.tolist()))
+        for tr, va in skf.split(np.zeros(n), labels)
+    ]
+
+
+def sample_train_val_test_split(
+    ds: FMRIDataset,
+    test_frac: float = 0.15,
+    val_frac: float = 0.15,
+    seed: int = 42,
+) -> Tuple[Subset, Subset, Subset]:
+    """Sample-level train/val/test split mirroring ``subject_train_val_test_split``.
+
+    Test = one StratifiedKFold fold of all windows; val = one fold of the remainder.
+    """
+    n = len(ds)
+    labels = ds.encoded_labels.numpy()
+    n_test_splits = max(2, round(1.0 / test_frac))
+    skf_test = StratifiedKFold(n_splits=n_test_splits, shuffle=True, random_state=seed)
+    trainval_idx, test_idx = next(skf_test.split(np.zeros(n), labels))
+
+    effective_val_frac = val_frac / (1.0 - test_frac)
+    n_val_splits = max(2, round(1.0 / effective_val_frac))
+    skf_val = StratifiedKFold(n_splits=n_val_splits, shuffle=True, random_state=seed + 1)
+    tr_rel, va_rel = next(skf_val.split(np.zeros(len(trainval_idx)), labels[trainval_idx]))
+    train_idx = trainval_idx[tr_rel]
+    val_idx = trainval_idx[va_rel]
+
+    print(f"Sample-level train/val/test split (label='{ds.label}') — LEAKY DIAGNOSTIC, "
+          f"subjects may span partitions")
+    print(f"  train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)} windows | "
+          f"subjects shared with test: {shared_subject_count(ds, train_idx, test_idx)}")
+    return (Subset(ds, sorted(train_idx.tolist())),
+            Subset(ds, sorted(val_idx.tolist())),
+            Subset(ds, sorted(test_idx.tolist())))
+
+
+def shared_subject_count(ds: FMRIDataset, idx_a, idx_b) -> int:
+    """Number of subjects that have windows in both index sets (0 for subject-level splits)."""
+    subjs = np.asarray(ds.subjs)
+    return int(len(np.intersect1d(np.unique(subjs[np.asarray(idx_a)]),
+                                  np.unique(subjs[np.asarray(idx_b)]))))
+
+
+def subject_overlap(subsets) -> int:
+    """Number of subjects present in more than one of the given Subsets (leakage report)."""
+    seen = {}
+    for k, sub in enumerate(subsets):
+        ds = sub.dataset
+        for s in np.unique(np.asarray(ds.subjs)[list(sub.indices)]):
+            seen.setdefault(s, set()).add(k)
+    return int(sum(1 for ks in seen.values() if len(ks) > 1))
+
+
+def split_kfold(ds: FMRIDataset, n_splits: int = 5, seed: int = 42,
+                protocol: str = "subject") -> List[Tuple[Subset, Subset]]:
+    """K-fold dispatcher: ``protocol`` selects subject-level or sample-level folds."""
+    _check_protocol(protocol)
+    if protocol == "sample":
+        return sample_kfold(ds, n_splits=n_splits, seed=seed)
+    return subject_kfold(ds, n_splits=n_splits, seed=seed)
+
+
+def split_train_val_test(ds: FMRIDataset, test_frac: float = 0.15, val_frac: float = 0.15,
+                         seed: int = 42, protocol: str = "subject") -> Tuple[Subset, Subset, Subset]:
+    """Single-split dispatcher: ``protocol`` selects subject-level or sample-level."""
+    _check_protocol(protocol)
+    if protocol == "sample":
+        return sample_train_val_test_split(ds, test_frac=test_frac, val_frac=val_frac, seed=seed)
+    return subject_train_val_test_split(ds, test_frac=test_frac, val_frac=val_frac, seed=seed)
+
+
+def split_inner_train_val(ds: FMRIDataset, train_indices, val_frac: float, seed: int,
+                          protocol: str = "subject"):
+    """Split a fold's training indices into (train, val) Subsets for the inner loop.
+
+    Subject-level: StratifiedGroupKFold over subjects (last inner fold is val).
+    Sample-level: StratifiedKFold over windows (last inner fold is val).
+    """
+    _check_protocol(protocol)
+    train_indices = np.asarray(list(train_indices), dtype=np.int64)
+    n_inner = max(2, round(1.0 / val_frac))
+    if protocol == "sample":
+        labels = ds.encoded_labels.numpy()[train_indices]
+        skf = StratifiedKFold(n_splits=n_inner, shuffle=True, random_state=seed)
+        _, va_rel = list(skf.split(np.zeros(len(train_indices)), labels))[-1]
+        val_mask = np.zeros(len(train_indices), dtype=bool)
+        val_mask[va_rel] = True
+        return (Subset(ds, train_indices[~val_mask].tolist()),
+                Subset(ds, train_indices[val_mask].tolist()))
+
+    subjs = np.asarray(ds.subjs)[train_indices]
+    unique_subjs = np.unique(subjs)
+    subj_labels = np.array([
+        np.argmax(np.bincount(ds.encoded_labels.numpy()[train_indices][subjs == s]))
+        for s in unique_subjs
+    ])
+    sgkf = StratifiedGroupKFold(n_splits=n_inner, shuffle=True, random_state=seed)
+    _, va_subj_idx = list(sgkf.split(unique_subjs, subj_labels, groups=unique_subjs))[-1]
+    val_subjs = unique_subjs[va_subj_idx]
+    val_mask = np.isin(subjs, val_subjs)
+    return (Subset(ds, train_indices[~val_mask].tolist()),
+            Subset(ds, train_indices[val_mask].tolist()))
 
 
 # ---------------------------------------------------------------------------

@@ -8,16 +8,41 @@ the names below lazily (module ``__getattr__``) to avoid a circular import.
 import numpy as np
 import wandb
 from time import time
-from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Subset
 
 from OCD_symphony.model import finetuning as _ft
+from OCD_symphony.model.config import FinetuneConfig
 from OCD_symphony.data_preparation.make_hcp_dataset import (
     make_hcp_dataset_from_pt,
-    subject_kfold,
-    subject_train_val_test_split,
+    split_kfold,
+    split_train_val_test,
+    split_inner_train_val,
+    subject_overlap,
+    apply_label_permutation,
     DATASET_DIRS,
 )
+
+
+def _protocol(args):
+    """Split protocol from args: 'subject' (default, valid) or 'sample' (leaky diagnostic).
+
+    Subject-level target scope always uses subject folds: one row per subject with
+    sample-level folds would put the same subject in train and test.
+    """
+    if getattr(args, "target_scope", "sample") == "subject":
+        return "subject"
+    return getattr(args, "split_protocol", "subject") or "subject"
+
+
+def _report_overlap(args, subsets, names, is_main):
+    """Print how many subjects appear in more than one partition (0 for subject protocol)."""
+    if not is_main:
+        return
+    n = subject_overlap(subsets)
+    tag = "" if _protocol(args) == "subject" else "  [sample protocol: LEAKY]"
+    detail = ", ".join(f"{nm}={len(s)}" for nm, s in zip(names, subsets))
+    print(f"[splits] protocol={_protocol(args)} | subjects shared across partitions: {n}{tag} | {detail}")
+
 
 
 def load_training_dataset(args, progress=None):
@@ -50,6 +75,18 @@ def _load_and_report(args, progress, is_main):
     return dataset, subjs
 
 
+def _apply_label_shuffle(args, dataset, is_main):
+    """Label-permutation null: permute subject labels once, before any split (splits unchanged)."""
+    cfg = FinetuneConfig.from_args(args)
+    if not cfg.shuffle_labels:
+        return None
+    info = apply_label_permutation(dataset, cfg.effective_perm_seed)
+    if is_main:
+        print(f"[Label permutation] labels shuffled across {info['n_subjects']} subjects "
+              f"(perm seed={info['seed']}); encoded_labels and splits unchanged")
+    return info
+
+
 def _wandb_start(args, name, is_main, reinit=False):
     """Start a W&B run on the main process when ``args.use_wandb`` is set."""
     if args.use_wandb and is_main:
@@ -70,49 +107,24 @@ def _wandb_finish(args, is_main):
 
 def split_fold_data(dataset, trainset, testset, fold_idx, args):
     """
-    Split a cross-validation fold trainset into train and validation sets
-    using subject-level StratifiedGroupKFold without data leakage.
+    Split a cross-validation fold trainset into train and validation sets.
+
+    Subject protocol: StratifiedGroupKFold over subjects (no subject in both sets).
+    Sample protocol: StratifiedKFold over windows (subjects may appear in both sets).
     """
-    ds = dataset
-    train_sample_indices = list(trainset.indices)
-    train_subjs = ds.subjs[train_sample_indices]
-
-    unique_train_subjs = np.unique(train_subjs)
-    train_enc = ds.encoded_labels.numpy()[train_sample_indices]
-    train_labels_subj = []
-    for s in unique_train_subjs:
-        mask = train_subjs == s
-        lbls = train_enc[mask]
-        counts = np.bincount(lbls)
-        train_labels_subj.append(np.argmax(counts))
-    train_labels_subj = np.array(train_labels_subj)
-
-    n_inner = max(2, round(1.0 / args.val_frac))
-    inner_sgkf = StratifiedGroupKFold(
-        n_splits=n_inner, shuffle=True, random_state=args.seed + fold_idx
+    protocol = _protocol(args)
+    trainset_inner, valset = split_inner_train_val(
+        dataset, list(trainset.indices), args.val_frac,
+        seed=args.seed + fold_idx, protocol=protocol,
     )
-    inner_splits = list(
-        inner_sgkf.split(unique_train_subjs, train_labels_subj, groups=unique_train_subjs)
-    )
-    _, val_subj_idx = inner_splits[-1]
-    train_subj_idx = np.setdiff1d(
-        np.arange(len(unique_train_subjs)), val_subj_idx
-    )
-
-    val_subjs = unique_train_subjs[val_subj_idx]
-    new_train_subjs = unique_train_subjs[train_subj_idx]
-
-    leaked = np.intersect1d(val_subjs, new_train_subjs)
-    if leaked.size:
-        raise AssertionError(f"Subject leakage detected: {leaked.tolist()}")
-
-    val_sample_indices = np.where(np.isin(ds.subjs, val_subjs))[0].tolist()
-    new_train_sample_indices = np.where(np.isin(ds.subjs, new_train_subjs))[0].tolist()
-
-    new_trainset = Subset(ds, new_train_sample_indices)
-    valset = Subset(ds, val_sample_indices)
-
-    return new_trainset, valset, testset
+    if protocol == "subject":
+        leaked = np.intersect1d(
+            np.unique(dataset.subjs[list(valset.indices)]),
+            np.unique(dataset.subjs[list(trainset_inner.indices)]),
+        )
+        if leaked.size:
+            raise AssertionError(f"Subject leakage detected: {leaked.tolist()}")
+    return trainset_inner, valset, testset
 
 
 def run_dapt(args, local_rank=0, epoch_callback=None, progress=None):
@@ -130,11 +142,15 @@ def run_dapt(args, local_rank=0, epoch_callback=None, progress=None):
         non-main ranks); ``history`` is the recon-loss history dict.
     """
     is_main = _ft.is_main_process()
+    if FinetuneConfig.from_args(args).shuffle_labels:
+        raise ValueError("shuffle_labels does not apply to Stage 3.1 DAPT (label-free)")
     dataset, _subjs = _load_and_report(args, progress, is_main)
 
-    trainset, valset, _testset = subject_train_val_test_split(
+    trainset, valset, _testset = split_train_val_test(
         dataset, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed,
+        protocol=_protocol(args),
     )
+    _report_overlap(args, [trainset, valset, _testset], ["train", "val", "test"], is_main)
 
     # DAPT trains on the train subjects only; the val subjects are the held-out
     # monitor set (used for checkpoint selection) and the test subjects stay
@@ -165,10 +181,13 @@ def run_single_split(args, local_rank=0, epoch_callback=None, progress=None):
     """Single deterministic train/val/test split using subject_train_val_test_split."""
     is_main = _ft.is_main_process()
     dataset, _subjs = _load_and_report(args, progress, is_main)
+    _apply_label_shuffle(args, dataset, is_main)
 
-    trainset, valset, testset = subject_train_val_test_split(
+    trainset, valset, testset = split_train_val_test(
         dataset, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed,
+        protocol=_protocol(args),
     )
+    _report_overlap(args, [trainset, valset, testset], ["train", "val", "test"], is_main)
 
     args._current_mode = "single"
     args._current_fold_idx = None
@@ -194,8 +213,9 @@ def run_single_fold(args, local_rank=0, epoch_callback=None, progress=None):
         )
 
     dataset, _subjs = _load_and_report(args, progress, is_main)
+    _apply_label_shuffle(args, dataset, is_main)
 
-    folds = list(subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed))
+    folds = list(split_kfold(dataset, n_splits=args.n_folds, seed=args.seed, protocol=_protocol(args)))
     trainset, testset = folds[args.fold_idx]
 
     if is_main:
@@ -206,6 +226,7 @@ def run_single_fold(args, local_rank=0, epoch_callback=None, progress=None):
     new_trainset, valset, testset = split_fold_data(
         dataset, trainset, testset, args.fold_idx, args
     )
+    _report_overlap(args, [new_trainset, valset, testset], ["train", "val", "test"], is_main)
 
     if is_main:
         print(
@@ -233,8 +254,9 @@ def run_cross_validation(args, local_rank=0, epoch_callback=None, progress=None)
     """Full K-fold leave-subject-out cross-validation using subject_kfold."""
     is_main = _ft.is_main_process()
     dataset, _subjs = _load_and_report(args, progress, is_main)
+    _apply_label_shuffle(args, dataset, is_main)
 
-    folds = list(subject_kfold(dataset, n_splits=args.n_folds, seed=args.seed))
+    folds = list(split_kfold(dataset, n_splits=args.n_folds, seed=args.seed, protocol=_protocol(args)))
 
     all_accs = []
     all_f1s = []
@@ -250,6 +272,7 @@ def run_cross_validation(args, local_rank=0, epoch_callback=None, progress=None)
         new_trainset, valset, testset = split_fold_data(
             dataset, trainset, testset, fold_idx, args
         )
+        _report_overlap(args, [new_trainset, valset, testset], ["train", "val", "test"], is_main)
 
         if is_main:
             print(

@@ -1023,8 +1023,23 @@ class PerceiverClassifier(nn.Module):
                 f"Unknown pooling method '{pooling}'. Must be 'mean', 'attention', or 'flatten'."
             )
 
-    def forward(self, roi_embeds, time_embeds, context_features, roi_pos):
-        recon, latents, _ = self.perceiver(roi_embeds, time_embeds, context_features, roi_pos)  # (B, R, D)
+    def forward(self, roi_embeds, time_embeds, context_features, roi_pos, segment=None, n_units=None):
+        """Classify windows, or subjects when ``segment`` is given.
+
+        ``segment`` (W,) maps each window to its unit (subject) in ``[0, n_units)``. Latents
+        are then mean-pooled over each unit's windows before the pooling head, so one
+        vector per subject is classified. Reconstruction stays per window.
+        """
+        recon, latents, _ = self.perceiver(roi_embeds, time_embeds, context_features, roi_pos)  # (W, R, D)
+        return self.classify(latents, segment, n_units), recon
+
+    def classify(self, latents, segment=None, n_units=None):
+        """Pooling head on Perceiver latents (W, R, D); returns logits.
+
+        With ``segment``, latents are first mean-pooled per unit (subject) -> (n_units, R, D).
+        """
+        if segment is not None:
+            latents = segment_mean(latents, segment, n_units)  # (S, R, D)
 
         if self.pooling == "flatten":
             reduced = self.reduction(latents)  # (B, 450, 30)
@@ -1037,8 +1052,21 @@ class PerceiverClassifier(nn.Module):
             attn_out, _ = self.pool_attn(query=cls_q, key=latents, value=latents)  # (B, 1, D)
             pooled = self.pool_norm(attn_out.squeeze(1))  # (B, D)
 
-        logits = self.classifier(pooled)
-        return logits, recon
+        return self.classifier(pooled)
+
+
+def segment_mean(latents, segment, n_units):
+    """Mean of ``latents`` (W, ...) over rows sharing a ``segment`` id; returns (n_units, ...).
+
+    Differentiable: built from ``index_add``, so gradients flow back to every window.
+    Every unit must have at least one window.
+    """
+    segment = torch.as_tensor(segment, device=latents.device, dtype=torch.long)
+    counts = torch.bincount(segment, minlength=int(n_units)).clamp(min=1).to(latents.dtype)
+    sums = latents.new_zeros((int(n_units),) + tuple(latents.shape[1:]))
+    sums = sums.index_add(0, segment, latents)
+    return sums / counts.view((-1,) + (1,) * (latents.dim() - 1))
+
 
 
 

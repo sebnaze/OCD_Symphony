@@ -31,10 +31,17 @@ from OCD_symphony.data_preparation.make_hcp_dataset import (
     FMRIDataset,
     _load_raw_file,
     make_hcp_dataset_from_pt,
-    subject_train_val_test_split,
+    split_train_val_test,
 )
-from OCD_symphony.data_validation.validate_preprocessing import compute_roi_correlation
+from OCD_symphony.model.constants import DIM, NUM_HEADS, ROIs, TIME_STEPS
+from OCD_symphony.model.latent_geometry import latent_geometry_metrics
+from OCD_symphony.model.model_components import PerceiverIOModelROIWise
+from OCD_symphony.data_validation.validate_preprocessing import compute_roi_correlation, load_RSNs
 from OCD_symphony.model.finetuning import build_pretrained_models
+from OCD_symphony.reconstruction.fc_metrics import (
+    EdgeAcrossSubjectsAccumulator, FCAccumulator, edge_across_subjects_summary,
+    network_membership, subject_fc_metrics, summarise_fc, upper_vector, window_fc,
+)
 
 DATA_DIR = DATASET_DIRS["hcp_ya"]  # kept for backward compatibility
 RESULTS_DIR = os.path.join(proj_dir, "results")
@@ -42,6 +49,9 @@ RESULTS_DIR = os.path.join(proj_dir, "results")
 # Subject-level split label per dataset. It stratifies the held-out test subjects, so it is
 # fixed here and does not depend on the target chosen for training.
 RECON_SPLIT_LABEL = {"hcp_ya": "gender", "ocd": "condition"}
+
+# Number of best and worst ROIs (by FC-profile correlation) reported in the FC view.
+FC_ROI_K = 10
 
 # ROI reindexing used by make_hcp_dataset (order: sub-ctx_R, sub-ctx_L, ctx_L, ctx_R)
 _ROI_INDS = torch.from_numpy(np.concatenate([
@@ -74,11 +84,14 @@ def fit_normalisation_stats(
     cache: bool = True,
     dataset: str = "hcp_ya",
     progress=None,
+    split_protocol: str = "subject",
 ) -> Dict[str, np.ndarray]:
     """Return ``{"W", "B", "test_subjs"}`` for the reconstruction data configuration.
 
     ``dataset`` is 'hcp_ya' or 'ocd'. The OCD cohort always uses all subjects, so W,B are
     fitted on the whole cohort and the test subjects come from the OCD split.
+    ``split_protocol`` is 'subject' (default) or 'sample' (leaky diagnostic); sample-protocol
+    caches are stored under a separate key so subject-level caches are never overwritten.
 
     The first call loads the full dataset once (~5 min) to fit the global
     per-ROI normalisation and the held-out test subject list, then caches them in
@@ -87,6 +100,8 @@ def fit_normalisation_stats(
     if dataset == "ocd":
         n_subjs = None
     key = _cache_key(n_subjs, max_abs, test_frac, val_frac, seed, dataset)
+    if split_protocol == "sample":
+        key += "_sample"
     path = os.path.join(RESULTS_DIR, f"dapt_recon_stats_{key}.npz")
     if cache and os.path.isfile(path):
         d = np.load(path, allow_pickle=False)
@@ -96,8 +111,8 @@ def fit_normalisation_stats(
         path=DATASET_DIRS[dataset], label=RECON_SPLIT_LABEL[dataset], n_subjs=n_subjs,
         max_abs=max_abs, dataset=dataset, progress=progress,
     )
-    _, _, testset = subject_train_val_test_split(
-        dataset_obj, test_frac=test_frac, val_frac=val_frac, seed=seed,
+    _, _, testset = split_train_val_test(
+        dataset_obj, test_frac=test_frac, val_frac=val_frac, seed=seed, protocol=split_protocol,
     )
     test_subjs = sorted(set(np.asarray(dataset_obj.subjs)[np.asarray(testset.indices)].tolist()))
     stats = {
@@ -315,8 +330,14 @@ def release_gpu_memory() -> None:
 
 
 def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, device,
-                     dataset: str = "hcp_ya"):
-    """Yield ``(orig, recon)`` numpy batches (n, R, T) for one subject, masking off."""
+                     dataset: str = "hcp_ya", return_latents: bool = False):
+    """Yield ``(orig, recon, fc_in[, latents])`` numpy batches for one subject, masking off.
+
+    ``orig``/``recon`` are (n, R, T) BOLD windows; ``fc_in`` is the stored input FC (n, R, R)
+    for the same windows, in the same ROI order. With ``return_latents`` a fourth item is
+    yielded: the Perceiver latents flattened to (n, R*D) float32. They come from the same
+    Perceiver call that produces ``recon``, so no extra forward pass is needed.
+    """
     spatial_model, temporal_model, conv_model, perceiver = models
     ds = load_subjects_normalised([sid], W, B, max_abs=max_abs, dataset=dataset)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -327,8 +348,36 @@ def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, de
         _, _, _, _, roi_embeds, roi_pos = spatial_model(gm, fmri, fc)
         _, _, _, _, time_embeds, _ = temporal_model(fmri)
         _, signal_context = conv_model(fmri, mask=None)
-        recon, _, _ = perceiver(roi_embeds, time_embeds, signal_context, roi_pos)
-        yield fmri.cpu().numpy(), recon.cpu().numpy()
+        recon, latents, _ = perceiver(roi_embeds, time_embeds, signal_context, roi_pos)
+        out = (fmri.cpu().numpy(), recon.cpu().numpy(), fc.cpu().numpy())
+        if return_latents:
+            out += (latents.reshape(latents.shape[0], -1).float().cpu().numpy(),)
+        yield out
+
+
+def _cap_windows(lat: np.ndarray, max_windows: Optional[int]) -> np.ndarray:
+    """First ``max_windows`` rows of a subject's latent matrix (all rows if None)."""
+    return lat if max_windows is None else lat[:max_windows]
+
+
+def random_perceiver_models(models, device, seed: int = 0):
+    """Return ``models`` with the Perceiver replaced by a randomly initialised one.
+
+    Same architecture as the loaded Perceiver (constructor arguments as in
+    ``checkpoints.build_pretrained_models``); encoders are shared with ``models``.
+    Seeded, so the baseline is reproducible.
+    """
+    spatial_model, temporal_model, conv_model, _ = models
+    torch.manual_seed(seed)
+    perceiver = PerceiverIOModelROIWise(
+        input_dim=64 * 3,
+        latent_dim=DIM,
+        num_rois=ROIs,
+        num_heads=NUM_HEADS,
+        time_steps=TIME_STEPS,
+    ).to(device)
+    perceiver.eval()
+    return spatial_model, temporal_model, conv_model, perceiver
 
 
 def _add_r2_sums(sums, orig, recon):
@@ -364,6 +413,10 @@ def reconstruct_subject_stats(
     device: Optional[torch.device] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     dataset: str = "hcp_ya",
+    geometry: bool = False,
+    geometry_baseline: bool = False,
+    max_windows_per_subject: Optional[int] = None,
+    seed: int = 0,
 ) -> Dict[str, object]:
     """Reconstruct ``subject_ids`` and return aggregate statistics plus traces for a
     small set of representative subjects. The GPU models are released before returning.
@@ -374,59 +427,160 @@ def reconstruct_subject_stats(
     Pass 2 re-runs inference for only the ``keep_k`` representative subjects to keep
     their full original/reconstructed traces (chosen after pass 1, so the median is known).
 
+    ``geometry`` collects the Perceiver latents of the same pass-1 forward (no extra model
+    compute) and stores ``latent_geometry_metrics`` in ``result["latent_geometry"]``.
+    ``geometry_baseline`` (implies ``geometry``) runs one more forward over the same subjects
+    with a randomly initialised Perceiver (``seed``) and stores its metrics in
+    ``result["latent_geometry_random"]``. ``max_windows_per_subject`` caps the windows used
+    for the latent metrics (first windows of each subject; None = all).
+
     Returns a dict with:
       r2 (R,), corr (N, R), subjs (N,) — over all reconstructed samples;
       subject_scores {subj: score}; representative (list, best first, worst last);
-      traces {subj: {"orig": (n, R, T), "recon": (n, R, T)}}.
+      traces {subj: {"orig": (n, R, T), "recon": (n, R, T)}};
+      latent_geometry / latent_geometry_random: metrics dict, or None when not requested.
     """
     if ckpt_path is not None and not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"DAPT checkpoint not found: {ckpt_path}")
     device = device or default_device()
+    geometry = geometry or geometry_baseline
     models = get_dapt_models(ckpt_path, device)
+    rand_models = None
     try:
         total = len(subject_ids)
+        # Progress steps: pass 1 per subject, optional random-Perceiver pass, pass 2 for representatives.
+        n_steps = total + keep_k + (total if geometry_baseline else 0)
         n_roi = None
         sums = None  # per-ROI running sums in float64
         corr_rows, subjs_rows = [], []
         subject_scores: Dict[str, float] = {}
         n_t = None
         n_done = 0
+        geo_X: List[np.ndarray] = []
+        geo_sids: List[str] = []
+
+        # Subject FC: network membership of each ROI (labels from the parcellation file).
+        membership, net_names = network_membership(np.asarray(load_RSNs()[0]))
+        fc_sids: List[str] = []
+        fc_edges: List[Dict[str, float]] = []
+        fc_profiles: List[np.ndarray] = []
+        fc_net_in: List[np.ndarray] = []
+        fc_net_rec: List[np.ndarray] = []
+        # Subject-level (specificity) measure: per-edge r across subjects, streamed.
+        edge_acc = None
 
         # ── Pass 1: stream all subjects ─────────────────────────────────────
         for sid in subject_ids:
             sid_corr = []
-            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
+            fc_acc = None  # (input FCAccumulator, reconstructed FCAccumulator)
+            lat_rows: List[np.ndarray] = []
+            for batch in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset,
+                                          return_latents=geometry):
+                o, r, fc_in = batch[:3]
+                if geometry:
+                    lat_rows.append(batch[3])
                 n_t = o.shape[2]
                 sums = _add_r2_sums(sums, o, r)
                 sid_corr.append(compute_roi_correlation(o, r))
                 subjs_rows.extend([sid] * o.shape[0])
+                if fc_acc is None:
+                    fc_acc = (FCAccumulator(o.shape[1]), FCAccumulator(o.shape[1]))
+                fc_acc[0].add(fc_in)
+                fc_acc[1].add(window_fc(r))
+            if geometry and lat_rows:
+                lat_sub = _cap_windows(np.concatenate(lat_rows, axis=0), max_windows_per_subject)
+                geo_X.append(lat_sub)
+                geo_sids.extend([sid] * lat_sub.shape[0])
             if sid_corr:
                 corr_all = np.concatenate(sid_corr, axis=0)
                 corr_rows.append(corr_all)
                 finite = corr_all[np.isfinite(corr_all)]
                 subject_scores[sid] = float(finite.mean()) if finite.size else float("nan")
+            if fc_acc is not None:
+                S_in_sub, S_rec_sub = fc_acc[0].mean(), fc_acc[1].mean()
+                m = subject_fc_metrics(S_in_sub, S_rec_sub, membership)
+                fc_sids.append(sid)
+                fc_edges.append(m["edge"])
+                fc_profiles.append(m["profile"])
+                fc_net_in.append(m["net_in"])
+                fc_net_rec.append(m["net_rec"])
+                v_in, v_rec = upper_vector(S_in_sub), upper_vector(S_rec_sub)
+                if edge_acc is None:
+                    edge_acc = EdgeAcrossSubjectsAccumulator(v_in.size)
+                edge_acc.add(v_in, v_rec)
             n_done += 1
             if progress is not None:
-                progress(n_done, total + keep_k)
+                progress(n_done, n_steps)
 
         if not corr_rows:
             raise RuntimeError("No subject could be reconstructed.")
 
-        r2 = _r2_from_sums(sums)
+        latent_geo = None
+        if geometry and geo_X:
+            X_lat = np.concatenate(geo_X, axis=0)
+            latent_geo = latent_geometry_metrics(X_lat, np.asarray(geo_sids))
+            del X_lat
+        geo_X = []
 
-        # ── Pass 2: traces for representative subjects only ─────────────────
+        latent_geo_random = None
+        if geometry_baseline:
+            rand_models = random_perceiver_models(models, device, seed=seed)
+            rand_X: List[np.ndarray] = []
+            rand_sids: List[str] = []
+            for sid in subject_ids:
+                rows: List[np.ndarray] = []
+                for batch in _forward_subject(rand_models, sid, W, B, max_abs, batch_size, device,
+                                              dataset, return_latents=True):
+                    rows.append(batch[3])
+                if rows:
+                    lat_sub = _cap_windows(np.concatenate(rows, axis=0), max_windows_per_subject)
+                    rand_X.append(lat_sub)
+                    rand_sids.extend([sid] * lat_sub.shape[0])
+                n_done += 1
+                if progress is not None:
+                    progress(n_done, n_steps)
+            if rand_X:
+                X_rand = np.concatenate(rand_X, axis=0)
+                latent_geo_random = latent_geometry_metrics(X_rand, np.asarray(rand_sids))
+                del X_rand
+            del rand_X
+            del rand_models
+            rand_models = None
+
+        r2 = _r2_from_sums(sums)
+        fc_summary = summarise_fc(
+            fc_sids, fc_edges, np.stack(fc_profiles), np.stack(fc_net_in), np.stack(fc_net_rec),
+            net_names, k=FC_ROI_K,
+        )
+        # Group-level: fc_summary["edge_summary"] (per-subject r across edges, bias, MAE, RMSE).
+        # Subject-level: per-edge r across subjects, group mean removed (specificity).
+        fc_summary["edge_across_subjects"] = (
+            edge_across_subjects_summary(edge_acc) if edge_acc is not None else None
+        )
+
+        # ── Pass 2: traces and full FC matrices for representative subjects only ──
         representative = select_representative_subjects(subject_scores, k=keep_k)
         traces: Dict[str, Dict[str, np.ndarray]] = {}
+        rep_fc: Dict[str, Dict[str, np.ndarray]] = {}
         for sid in representative:
             o_list, r_list = [], []
-            for o, r in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
+            fc_acc = None
+            for o, r, fc_in in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
                 o_list.append(o)
                 r_list.append(r)
+                if fc_acc is None:
+                    fc_acc = (FCAccumulator(o.shape[1]), FCAccumulator(o.shape[1]))
+                fc_acc[0].add(fc_in)
+                fc_acc[1].add(window_fc(r))
             traces[sid] = {"orig": np.concatenate(o_list, axis=0),
                            "recon": np.concatenate(r_list, axis=0)}
+            if fc_acc is not None:
+                rep_fc[sid] = {"input": fc_acc[0].mean(), "recon": fc_acc[1].mean()}
             n_done += 1
             if progress is not None:
-                progress(n_done, total + keep_k)
+                progress(n_done, n_steps)
+
+        fc_summary["representative"] = rep_fc
 
         return {
             "r2": r2,
@@ -435,10 +589,14 @@ def reconstruct_subject_stats(
             "subject_scores": subject_scores,
             "representative": representative,
             "traces": traces,
+            "fc": fc_summary,
             "n_timepoints": n_t,
             "source": "dapt" if ckpt_path is not None else "baseline",
             "dataset": dataset,
+            "latent_geometry": latent_geo,
+            "latent_geometry_random": latent_geo_random,
         }
     finally:
         del models
+        del rand_models
         release_gpu_memory()

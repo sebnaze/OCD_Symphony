@@ -5,6 +5,8 @@ Moved out of ``finetuning.py`` (Phase 6). ``finetuning.py`` re-exports every nam
 from dataclasses import dataclass, fields
 from typing import Optional
 
+import numpy as np
+
 from OCD_symphony.model.constants import LEARNING_RATE
 
 
@@ -35,17 +37,35 @@ class FinetuneConfig:
     fold_idx: Optional[int] = 0
     dapt_ckpt: Optional[str] = None
     dapt_init_ckpt: Optional[str] = None
+    # Stage 3.1 start from a DAPT checkpoint: encoders + Perceiver (mutually exclusive with dapt_init_ckpt).
+    dapt_encoder_init: Optional[str] = None
     dapt_ckpt_name: Optional[str] = None
     dapt_mask_ratio: Optional[float] = None
     dapt_mask_ratio_spatial: float = 0.7
     dapt_mask_ratio_temporal: float = 0.7
     dapt_mask_ratio_context: float = 0.5
     dapt_weights: str = "1,1,1,1"
+    # Stage 3.1 loss: "mse" (masked reconstruction only) or "vicreg" (MSE + VICReg on Perceiver latents).
+    dapt_loss: str = "mse"
+    vicreg_weight: float = 1.0
     grad_clip: float = 1.0
     val_mask_seed: int = 1234
     max_abs: float = 1e4
     current_mode: str = "single"
     current_fold_idx: Optional[int] = None
+    # "sample": one classifier input per window. "subject": Perceiver latents are
+    # mean-pooled over each subject's windows, and one vector per subject is classified.
+    target_scope: str = "sample"
+    # Label-permutation null: permute subject labels once before splitting (Stages 1/2/3.2).
+    shuffle_labels: bool = False
+    seed: int = 42
+    # None falls back to ``seed``.
+    label_perm_seed: Optional[int] = None
+
+    @property
+    def effective_perm_seed(self) -> int:
+        """Seed of the label permutation (``label_perm_seed``, else ``seed``)."""
+        return self.label_perm_seed if self.label_perm_seed is not None else self.seed
 
     @classmethod
     def from_args(cls, args):
@@ -73,6 +93,21 @@ def _resolve_dapt_mask_ratios(args):
     tp = cfg.dapt_mask_ratio_temporal
     cx = cfg.dapt_mask_ratio_context
     return float(sp), float(tp), float(cx)
+
+
+DAPT_LOSSES = ("mse", "vicreg")
+
+
+def _resolve_dapt_loss(args):
+    """Resolve the Stage 3.1 loss -> (mode, vicreg_weight). mode is 'mse' or 'vicreg'."""
+    cfg = FinetuneConfig.from_args(args)
+    mode = str(cfg.dapt_loss or "mse").lower()
+    if mode not in DAPT_LOSSES:
+        raise ValueError(f"--dapt_loss must be one of {DAPT_LOSSES}, got {mode!r}")
+    w = float(cfg.vicreg_weight)
+    if not np.isfinite(w) or w <= 0:
+        raise ValueError(f"--vicreg_weight must be a positive finite number, got {w!r}")
+    return mode, w
 
 
 def _parse_dapt_weights(args):

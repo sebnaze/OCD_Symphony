@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import torch
 import torch.nn as nn
@@ -36,7 +37,7 @@ from OCD_symphony.model.constants import (
     TIME_STEPS,
 )
 from OCD_symphony.model.config import (
-    FinetuneConfig, _CONFIG_ATTR_SOURCE, _parse_dapt_weights, _resolve_dapt_mask_ratios,
+    FinetuneConfig, _CONFIG_ATTR_SOURCE, _parse_dapt_weights, _resolve_dapt_mask_ratios, _resolve_dapt_loss,
 )
 from OCD_symphony.model.checkpoints import (
     build_pretrained_models, _load_perceiver_from_classifier_ckpt,
@@ -168,15 +169,31 @@ def get_experiment_tag(args, mode: str, fold_idx: int = None) -> str:
         mode_str = str(mode)
 
     # Stage 3.1 — DAPT (reconstruction only) has its own tag shape
+    # Sample-protocol runs (leaky diagnostic) get a suffix so they never overwrite subject-level files.
+    sample_suffix = "_sample" if getattr(args, "split_protocol", "subject") == "sample" else ""
+    # Subject-level target scope gets its own suffix so its checkpoints and run files never overwrite window-level ones.
+    if cfg.target_scope == "subject":
+        sample_suffix += "_subjscope"
+    # Label-permutation null gets its own suffix so shuffled runs never overwrite real ones.
+    if cfg.shuffle_labels:
+        sample_suffix += f"_shuffled{cfg.effective_perm_seed}"
     if cfg.mode == "dapt":
         sp, tp, cx = _resolve_dapt_mask_ratios(args)
         lr = cfg.learning_rate
+        # VicReg runs get their own tag so they never overwrite MSE-only checkpoints.
+        loss_mode, vicreg_w = _resolve_dapt_loss(args)
+        loss_str = f"_vicreg{vicreg_w:g}" if loss_mode == "vicreg" else ""
+        # Init from a DAPT checkpoint: suffix keyed on the source file so it never collides with its source.
+        init_str = ""
+        if cfg.dapt_encoder_init:
+            src_hash = hashlib.sha1(os.path.basename(str(cfg.dapt_encoder_init)).encode()).hexdigest()[:6]
+            init_str = f"_from{src_hash}"
         return (
             f"{prefix}{label_str}_dapt_mS{sp:.2f}_mT{tp:.2f}_mC{cx:.2f}"
-            f"_lr{lr:.0e}_{mode_str}"
+            f"_lr{lr:.0e}{loss_str}{init_str}_{mode_str}{sample_suffix}"
         )
 
-    return f"{prefix}{label_str}_{stage_str}_{pool_str}_{lr_str}{alpha_str}_{mode_str}"
+    return f"{prefix}{label_str}_{stage_str}_{pool_str}_{lr_str}{alpha_str}_{mode_str}{sample_suffix}"
 
 
 class _RecordingSampler(torch.utils.data.Sampler):
@@ -212,6 +229,129 @@ def _unwrap(model, ddp):
     return model.module if ddp else model
 
 
+class SubjectBatchSampler(torch.utils.data.Sampler):
+    """Yields lists of window positions so that every batch holds whole subjects.
+
+    ``subjects[p]`` is the subject of window position ``p``. A batch covers ``batch_subjects``
+    subjects with all of their windows. With ``shuffle``, the subject order is reshuffled each
+    epoch from ``seed + epoch``. Every window is yielded exactly once per epoch.
+    """
+
+    def __init__(self, subjects, batch_subjects, shuffle=False, seed=0):
+        subjects = np.asarray(subjects)
+        if batch_subjects < 1:
+            raise ValueError("batch_subjects must be >= 1")
+        uniq, inv = np.unique(subjects, return_inverse=True)
+        order = np.argsort(inv, kind="stable")
+        self.groups = np.split(order, np.cumsum(np.bincount(inv))[:-1])
+        self.n_subjects = len(uniq)
+        self.batch_subjects = int(batch_subjects)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self):
+        return -(-self.n_subjects // self.batch_subjects)
+
+    def __iter__(self):
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            subj_order = rng.permutation(self.n_subjects)
+        else:
+            subj_order = np.arange(self.n_subjects)
+        self.epoch += 1
+        for start in range(0, self.n_subjects, self.batch_subjects):
+            chunk = subj_order[start:start + self.batch_subjects]
+            yield np.concatenate([self.groups[k] for k in chunk]).tolist()
+
+
+class _PositionedWindows(torch.utils.data.Dataset):
+    """Window dataset whose items also carry their position and subject ID.
+
+    Used only for subject-level batches, which are assembled by ``_collate_subjects``.
+    """
+
+    def __init__(self, base, subjects):
+        self.base = base
+        self.subjects = np.asarray(subjects)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        fmri, fc, gm, label = self.base[i]
+        return fmri, fc, gm, label, i, self.subjects[i]
+
+
+def _collate_subjects(items):
+    """Stack the windows of whole subjects into one batch.
+
+    Returns the 8-tuple ``(fmri, fc, gm, unit_labels, segment, n_units, subjects, positions)``:
+    ``segment`` maps each window to its subject index in the batch; ``unit_labels`` holds one
+    target per subject. Raises if a subject's windows carry different labels.
+    """
+    fmri = torch.stack([it[0] for it in items])
+    fc = torch.stack([it[1] for it in items])
+    gm = torch.stack([it[2] for it in items])
+    labels = torch.stack([torch.as_tensor(it[3]) for it in items])
+    positions = np.asarray([it[4] for it in items], dtype=np.int64)
+    subj = np.asarray([it[5] for it in items])
+    uniq, first, seg = np.unique(subj, return_index=True, return_inverse=True)
+    unit_labels = labels[torch.as_tensor(first)]
+    if not torch.equal(labels, unit_labels[torch.as_tensor(seg)]):
+        raise RuntimeError("windows of one subject carry different labels")
+    return (fmri, fc, gm, unit_labels, torch.as_tensor(seg, dtype=torch.long),
+            len(uniq), uniq, positions)
+
+
+def _unpack_batch(batch):
+    """Return the 8-tuple form for both window batches (4-tuple) and subject batches."""
+    if len(batch) == 4:
+        fmri, fc, gm, labels = batch
+        return fmri, fc, gm, labels, None, None, None, None
+    return batch
+
+
+def _perceive_chunked(perceiver, roi_embeds, time_embeds, signal_context, roi_pos, chunk, checkpoint_grads):
+    """Run the Perceiver over the windows in chunks of ``chunk``; returns (recon, latents).
+
+    Windows are independent in the Perceiver, so chunking changes no result. With gradients
+    on, each chunk is gradient-checkpointed: its attention activations are recomputed in the
+    backward pass instead of being held for the whole subject batch (exact gradients).
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    def _fwd(*a):
+        rec, lat, _ = perceiver(*a)
+        return rec, lat
+
+    recons, lats = [], []
+    for i in range(0, roi_embeds.shape[0], chunk):
+        sl = slice(i, i + chunk)
+        parts = (roi_embeds[sl], time_embeds[sl], signal_context[sl], roi_pos[sl])
+        if checkpoint_grads and torch.is_grad_enabled():
+            rec, lat = checkpoint(_fwd, *parts, use_reentrant=False)
+        else:
+            rec, lat = _fwd(*parts)
+        recons.append(rec)
+        lats.append(lat)
+    return torch.cat(recons), torch.cat(lats)
+
+
+# Windows per Perceiver call under subject-level scope (bounds attention memory per step).
+SUBJECT_PERCEIVER_CHUNK = 8
+
+
+def _unit_arrays(ds):
+    """Per-subject (subject_ids, targets) of a (nested) subset, one entry per subject.
+
+    ``targets`` is the first window's target of each subject (constant within a subject).
+    """
+    subj, tgt = _subject_ids_and_labels(ds, np.arange(len(ds)))
+    uniq, first = np.unique(subj, return_index=True)
+    return uniq, tgt[first]
+
+
 def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None):
     """
     Fine-tune the pretrained Perceiver classifier on the HCP dataset for gender classification.
@@ -240,6 +380,8 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
     is_main = is_main_process()
 
     cfg = FinetuneConfig.from_args(args)
+    # Subject-level scope: one classifier input per subject (latents pooled over its windows).
+    is_subject = cfg.target_scope == "subject"
 
     # ── Task: classification (gender / condition) or regression (age) ───────
     _tpos, root_ds = _root_indices(trainset)
@@ -247,16 +389,31 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
     target_mu, target_sd = 0.0, 1.0
     if is_regression:
         # Standardise the age target with training-split statistics only.
-        _t = root_ds.targets[torch.as_tensor(_tpos)].double()
+        # Subject scope: statistics over subjects (one target each), matching what the model sees.
+        _t = (torch.as_tensor(_unit_arrays(trainset)[1]).double() if is_subject
+              else root_ds.targets[torch.as_tensor(_tpos)].double())
         target_mu = float(_t.mean())
         target_sd = float(_t.std()) if _t.numel() > 1 else 0.0
         if not target_sd > 0:
             target_sd = 1.0
         if is_main:
             print(f"[Regression] age target: train mean={target_mu:.2f}, sd={target_sd:.2f}")
+    if is_subject and is_main:
+        _n_tr = len(_unit_arrays(trainset)[0])
+        print(f"[Target scope] subject-level: one vector per subject, {_n_tr} training subjects, "
+              f"{args.batch_size} subjects per batch")
 
     # ── DataLoaders  (DistributedSampler for train in DDP mode) ────────────
-    if args.ddp:
+    train_order = None
+    if is_subject:
+        # Whole subjects per batch; the sampler and collate own the batch layout.
+        train_subj = _subject_ids_and_labels(trainset, np.arange(len(trainset)))[0]
+        train_loader = DataLoader(
+            _PositionedWindows(trainset, train_subj),
+            batch_sampler=SubjectBatchSampler(train_subj, args.batch_size, shuffle=True, seed=args.seed),
+            collate_fn=_collate_subjects, num_workers=4,
+        )
+    elif args.ddp:
         train_sampler = DistributedSampler(
             trainset, shuffle=True,
             rank=dist.get_rank(), num_replicas=dist.get_world_size(),
@@ -274,10 +431,18 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
             sampler=train_order, num_workers=4, pin_memory=True, drop_last=False,
         )
 
-    val_loader   = DataLoader(valset,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=4, pin_memory=False)
-    test_loader  = DataLoader(testset,  batch_size=args.batch_size,
-                              shuffle=False, num_workers=4, pin_memory=False)
+    def _eval_loader(ds):
+        if is_subject:
+            subj = _subject_ids_and_labels(ds, np.arange(len(ds)))[0]
+            return DataLoader(
+                _PositionedWindows(ds, subj),
+                batch_sampler=SubjectBatchSampler(subj, args.batch_size, shuffle=False),
+                collate_fn=_collate_subjects, num_workers=4,
+            )
+        return DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=False)
+
+    val_loader = _eval_loader(valset)
+    test_loader = _eval_loader(testset)
 
     # ── Load pretrained models (HCP-AGING, or DAPT-adapted HCP-YA weights) ──
     dapt_ckpt = None
@@ -367,10 +532,13 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
     # Inverse-frequency class weights to penalize collapsing into majority class
     criterion = None
     if not is_regression:
-        if isinstance(trainset, Subset):
-            train_labels_tensor = trainset.dataset.encoded_labels[trainset.indices]
+        if is_subject:
+            # One class count per subject: the model's training unit is the subject.
+            train_labels_tensor = torch.as_tensor(_unit_arrays(trainset)[1]).long()
+        elif isinstance(trainset, Subset):
+            train_labels_tensor = trainset.dataset.labels_tensor[trainset.indices]
         else:
-            train_labels_tensor = trainset.encoded_labels
+            train_labels_tensor = trainset.labels_tensor
 
         class_counts = torch.bincount(train_labels_tensor)
         class_weights = (len(train_labels_tensor) / (len(class_counts) * class_counts.float())).to(device)
@@ -398,6 +566,21 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
         _, signal_context = conv_model(fmri, mask=None)
         return roi_embeds, roi_pos, time_embeds, signal_context
 
+    def _classify(roi_embeds, time_embeds, signal_context, roi_pos, segment=None, n_units=None):
+        """Logits and reconstruction for one batch.
+
+        Window scope: the classifier as usual. Subject scope: the Perceiver runs over the
+        windows in checkpointed chunks, then the pooling head runs once per subject.
+        """
+        if segment is None:
+            return classifier(roi_embeds, time_embeds, signal_context, roi_pos)
+        raw = _unwrap(classifier, args.ddp)
+        recon, latents = _perceive_chunked(
+            raw.perceiver, roi_embeds, time_embeds, signal_context, roi_pos,
+            SUBJECT_PERCEIVER_CHUNK, checkpoint_grads=True,
+        )
+        return raw.classify(latents, segment, n_units), recon
+
     def _run_eval(loader, dataset, name, with_loss=False):
         """Evaluation pass (no grad) over ``loader``. Returns per-sample lists and local counts.
 
@@ -408,15 +591,19 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
                "subj": [], "loss_sum": 0.0, "n": 0}
         pos = 0
         with torch.no_grad():
-            for fmri, fc, gm, labels in loader:
+            for batch in loader:
+                fmri, fc, gm, labels, segment, n_units, units_subj, units_pos = _unpack_batch(batch)
                 fmri, fc, gm, labels = (
                     fmri.to(device),
                     fc.to(device),
                     gm.to(device),
                     labels.to(device),
                 )
+                if segment is not None:
+                    segment = segment.to(device)
                 roi_embeds, roi_pos, time_embeds, signal_context = _encode(fmri, fc, gm)
-                logits, _recon = classifier(roi_embeds, time_embeds, signal_context, roi_pos)
+                logits, _recon = _classify(roi_embeds, time_embeds, signal_context, roi_pos,
+                                           segment=segment, n_units=n_units)
                 preds = _to_pred(logits)
 
                 if with_loss:
@@ -432,12 +619,16 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
                 out["total"] += labels.size(0)
                 out["preds"].extend(preds.cpu().tolist())
                 out["labels"].extend(labels.cpu().tolist())
-                _pos = np.arange(pos, pos + labels.size(0))
-                pos += labels.size(0)
-                _subj, _enc = _subject_ids_and_labels(dataset, _pos)
-                if not np.array_equal(_enc, labels.cpu().numpy()):
-                    raise RuntimeError(f"{name} batch does not match the dataset order")
-                out["subj"].extend(_subj.tolist())
+                if segment is not None:
+                    # Subject batch: one prediction per subject, labels already checked in the collate.
+                    out["subj"].extend(units_subj.tolist())
+                else:
+                    _pos = np.arange(pos, pos + labels.size(0))
+                    pos += labels.size(0)
+                    _subj, _enc = _subject_ids_and_labels(dataset, _pos)
+                    if not np.array_equal(_enc, labels.cpu().numpy()):
+                        raise RuntimeError(f"{name} batch does not match the dataset order")
+                    out["subj"].extend(_subj.tolist())
                 out["probs"].append(torch.softmax(logits, dim=1).cpu().numpy())
         return out
 
@@ -501,19 +692,23 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
 
         alpha = cfg.recon_weight
 
-        for fmri, fc, gm, labels in train_loader:
+        for batch in train_loader:
+            fmri, fc, gm, labels, segment, n_units, units_subj, units_pos = _unpack_batch(batch)
             fmri, fc, gm, labels = (
                 fmri.to(device),
                 fc.to(device),
                 gm.to(device),
                 labels.to(device),
             )
+            if segment is not None:
+                segment = segment.to(device)
 
             # Encoders keep the autograd graph only when they are being fine-tuned.
             with torch.set_grad_enabled(train_encoders):
                 roi_embeds, roi_pos, time_embeds, signal_context = _encode(fmri, fc, gm)
 
-            logits, recon = classifier(roi_embeds, time_embeds, signal_context, roi_pos)
+            logits, recon = _classify(roi_embeds, time_embeds, signal_context, roi_pos,
+                                      segment=segment, n_units=n_units)
             loss_cls = _task_loss(logits, labels)
             if alpha > 0.0:
                 # Scale MSE by baseline (~1.40) so both losses sit on approximately a [0, 1] scale
@@ -535,14 +730,18 @@ def finetune(trainset, valset, testset, args, local_rank=0, epoch_callback=None)
                 correct += (preds == labels).sum().item()
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
-            # Batch k covers the sampler positions [train_pos, train_pos + bs).
-            _bs = labels.size(0)
-            _pos = train_order.order[train_pos:train_pos + _bs]
-            train_pos += _bs
-            _subj, _enc = _subject_ids_and_labels(trainset, _pos)
-            if not np.array_equal(_enc, labels.cpu().numpy()):
-                raise RuntimeError("training batch does not match the recorded sampler order")
-            train_subj.extend(_subj.tolist())
+            if segment is not None:
+                # Subject batch: one training unit per subject.
+                train_subj.extend(units_subj.tolist())
+            else:
+                # Batch k covers the sampler positions [train_pos, train_pos + bs).
+                _bs = labels.size(0)
+                _pos = train_order.order[train_pos:train_pos + _bs]
+                train_pos += _bs
+                _subj, _enc = _subject_ids_and_labels(trainset, _pos)
+                if not np.array_equal(_enc, labels.cpu().numpy()):
+                    raise RuntimeError("training batch does not match the recorded sampler order")
+                train_subj.extend(_subj.tolist())
             train_probs.append(torch.softmax(logits.detach(), dim=1).cpu().numpy())
 
         total = len(all_labels)
@@ -887,6 +1086,11 @@ def parse_args():
         help="Pooling strategy for ROI latents ('mean', 'attention', or 'flatten')"
     )
     parser.add_argument(
+        '--target_scope', type=str, choices=['sample', 'subject'], default='sample',
+        help="'sample': classify each window. 'subject': mean-pool latents over each subject's "
+             "windows and classify one vector per subject (subject-level folds, no DDP)."
+    )
+    parser.add_argument(
         '--dropout', type=float, default=0.3,
         help='Dropout rate in classification head (default: 0.3)'
     )
@@ -948,6 +1152,20 @@ def parse_args():
              'spatial,temporal,conv,perceiver (default: 1,1,1,1).'
     )
     parser.add_argument(
+        '--dapt_loss', type=str, default='mse', choices=['mse', 'vicreg'],
+        help="DAPT loss: 'mse' (masked reconstruction only, default) or 'vicreg' "
+             "(adds a VICReg term on the Perceiver latents of two masked views)."
+    )
+    parser.add_argument(
+        '--dapt_encoder_init', type=str, default=None,
+        help='Stage 3.1 only: start encoders and Perceiver from this DAPT checkpoint instead of '
+             'HCP-AGING. Not combinable with --dapt_init_ckpt (classifier checkpoint, Perceiver only).'
+    )
+    parser.add_argument(
+        '--vicreg_weight', type=float, default=1.0,
+        help='Weight of the VICReg term in --dapt_loss vicreg (default: 1.0).'
+    )
+    parser.add_argument(
         '--dapt_ckpt_name', type=str, default=None,
         help='Optional filename override for the saved DAPT checkpoint.'
     )
@@ -973,6 +1191,15 @@ def parse_args():
         '--ddp', action='store_true',
         help='Enable DistributedDataParallel (multi-GPU). Launch with torchrun.'
     )
+    parser.add_argument(
+        '--shuffle_labels', action='store_true',
+        help='Label-permutation null: permute subject labels across subjects once, before '
+             'splitting (splits unchanged). Not valid for --mode dapt.'
+    )
+    parser.add_argument(
+        '--label_perm_seed', type=int, default=None,
+        help='Seed for the label permutation (default: --seed).'
+    )
     args = parser.parse_args()
     _validate_args(parser, args)
     return args
@@ -986,8 +1213,15 @@ def _validate_args(parser, args):
                      f"choose one of {list(available)}")
     if args.mode == "dapt" and args.ddp:
         parser.error("--mode dapt does not support --ddp (run DAPT on a single process)")
+    if args.mode == "dapt" and getattr(args, "shuffle_labels", False):
+        parser.error("--shuffle_labels does not apply to --mode dapt (Stage 3.1 is label-free)")
     if not 0.0 <= float(args.recon_weight) <= 1.0:
         parser.error(f"--recon_weight must be in [0, 1], got {args.recon_weight}")
+    if getattr(args, "target_scope", "sample") == "subject":
+        if args.mode == "dapt":
+            parser.error("--target_scope subject does not apply to --mode dapt (per-window reconstruction)")
+        if args.ddp:
+            parser.error("--target_scope subject does not support --ddp in this version")
 
 
 # Experiment wrappers live in experiment.py (Phase 4); DAPT training lives in dapt.py (Phase 6).
