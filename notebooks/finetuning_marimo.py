@@ -648,6 +648,8 @@ def _(
     # `return` is not allowed here; the work is gated with `if` instead.
     config, history, test_acc, test_f1 = None, None, None, None
     probe_payload = None
+    # Stage 3.1 only: path of the checkpoint saved by this run (None for every other stage).
+    dapt_ckpt_path = None
 
     # Stage 3.2 needs a DAPT checkpoint; without one, Start does nothing.
     _blocked = stage_selector.value == "stage3_2" and post_ckpt_selector.value is None
@@ -860,7 +862,7 @@ def _(
                         _stack.close()
                 elif is_dapt:
                     # Stage 3.1 is a single reconstruction-pretraining run.
-                    _ckpt_path, history = run_dapt(args, epoch_callback=_on_epoch, progress=_on_load)
+                    dapt_ckpt_path, history = run_dapt(args, epoch_callback=_on_epoch, progress=_on_load)
                     test_acc, test_f1 = None, None
                 elif is_cv_mode:
                     test_acc, test_f1, history = run_cross_validation(args, epoch_callback=_on_epoch, progress=_on_load)
@@ -874,7 +876,7 @@ def _(
 
         config = None if (is_probe_mode or is_fc_mode) else vars(args)
 
-    return config, history, test_acc, test_f1, probe_payload
+    return config, history, test_acc, test_f1, probe_payload, dapt_ckpt_path
 
 
 @app.cell
@@ -1280,6 +1282,7 @@ def _(find_ckpt, os):
         found = {os.path.basename(c) for c in (find_ckpt(m) for m in run_metas.values()) if c}
         out = []
         for key in ("dapt_ckpt", "dapt_init_ckpt", "dapt_encoder_init"):
+            value = (target.get("config") or {}).get(key)
             if value and os.path.basename(str(value)) not in found:
                 out.append((key, os.path.basename(str(value))))
         return out
@@ -1857,19 +1860,43 @@ def _(find_ckpt, get_loaded_for, mo, run_metas, set_loaded_ckpt):
     _meta = run_metas.get(get_loaded_for())
     if _meta is not None:
         from OCD_symphony.reconstruction.dapt_reconstruction import (
-            MissingEncoderError, load_reconstruction_checkpoint,
+            MissingEncoderError as _MissingEncoderError,
+            load_reconstruction_checkpoint as _load_recon_ckpt,
         )
         _ck = find_ckpt(_meta)
         if _ck:
             try:
-                load_reconstruction_checkpoint(_ck, "cpu")
-            except MissingEncoderError as _exc:
+                _load_recon_ckpt(_ck, "cpu")
+            except _MissingEncoderError as _exc:
                 _load_view = mo.callout(mo.md(f"Cannot reconstruct this run: {_exc}"), kind="warn")
             except (ValueError, FileNotFoundError) as _exc:
                 print(f"[load] checkpoint not usable for reconstruction: {_exc}")
             else:
                 set_loaded_ckpt(_ck)
     _load_view
+
+
+
+@app.cell
+def _(dapt_ckpt_path, mo, set_loaded_ckpt):
+    # Stage 3.1 hand-off: the checkpoint saved by the DAPT run that just finished becomes the
+    # reconstruction source, without a Load History click. dapt_ckpt_path is None for every
+    # other stage, so this cell does nothing then. Validated like a loaded run.
+    _handoff_view = None
+    if dapt_ckpt_path is not None:
+        from OCD_symphony.reconstruction.dapt_reconstruction import (
+            MissingEncoderError as _MissingEncoderError,
+            load_reconstruction_checkpoint as _load_recon_ckpt,
+        )
+        try:
+            _load_recon_ckpt(dapt_ckpt_path, "cpu")
+        except _MissingEncoderError as _exc:
+            _handoff_view = mo.callout(mo.md(f"Cannot reconstruct this run: {_exc}"), kind="warn")
+        except (ValueError, FileNotFoundError) as _exc:
+            print(f"[handoff] DAPT checkpoint not usable for reconstruction: {_exc}")
+        else:
+            set_loaded_ckpt(dapt_ckpt_path)
+    _handoff_view
 
 
 
