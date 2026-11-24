@@ -2,20 +2,34 @@
 
 ##########################################################################
 #
-#  Script:    make_torch_files_parallel.pbs
+#  Script:    make_torch_files_hcp_parallel.pbs
 #  Author:    Sebastien Naze
 #  Created:   2025-10
+#  Updated:   paper-matched preprocessing (default mode of make_torch_files_hcp.py)
 #
 ##########################################################################
-
-#PBS -N make_torch_files_parallel
-#PBS -l ncpus=2,mem=64gb,walltime=00:45:00
+#
+# One array job per HCP-YA subject. Index = position in the sorted list of subjects that have
+# demographics and an extracted MNINonLinear folder (same list as make_torch_files_hcp.py --idx).
+# Each job cleans its 4 resting runs (about 13 minutes per subject), so the walltime is 1 h.
+#
+# Submit (N = number of subjects in that list; check with the count printed by the first job):
+#   qsub -J 1-1000 make_torch_files_hcp_parallel.pbs
+#   qsub -J 1-1000 -v OUT_DIR=/path/to/out,OVERWRITE=1 make_torch_files_hcp_parallel.pbs
+#
+# OUT_DIR    output folder (default: data/hcp_paper).
+# OVERWRITE  set to 1 to recompute subjects that already have an output file.
+#
+# Legacy extraction is not run from this script (use make_torch_files_hcp.py --legacy directly).
+#
+#PBS -N make_torch_files_hcp_paper
+#PBS -l ncpus=2,mem=64gb,walltime=01:00:00
 #PBS -m abe
 #PBS -M sebastien.naze@qimrberghofer.edu.au
 #PBS -o /working/lab_lucac/sebastiN/projects/OCD_Symphony/.pbs_logs/
 #PBS -e /working/lab_lucac/sebastiN/projects/OCD_Symphony/.pbs_logs/
 #
-# Script to extract time series and FC from fMRI data and store it in torch files
+# Script to extract paper-matched ROI time series from HCP-YA data into torch files
 #
 #module load fsl/6.0.1
 
@@ -24,14 +38,14 @@
 source activate ocd-symphony
 
 proj_dir=/mnt/lustre/working/lab_lucac/sebastiN/projects/OCD_Symphony/
-#baseline_dir=/mnt/lustre/working/lab_lucac/sebastiN/projects/OCDbaseline/
-#pp_dir=${proj_dir}postprocessing/
+cd ${proj_dir}
 
-# load specific subject from subject list
-# mapfile -t subj_array < ${proj_dir}data/subject_list.txt
 IDX=$((PBS_ARRAY_INDEX-1))  # double parenthesis needed for arithmetic operations
-# subj=${subj_array[$IDX]}
-# echo "Current subject: " ${subj}
+echo "Array index: ${IDX}"
 
-echo 'Extracting time series, compute FC, and store in torch file ...'
-python ${proj_dir}src/OCD_symphony/data_preparation/make_torch_files_hcp.py --idx $IDX
+out_args=""
+if [ -n "${OUT_DIR}" ]; then out_args="--out_dir ${OUT_DIR}"; fi
+if [ "${OVERWRITE}" == "1" ]; then out_args="${out_args} --overwrite"; fi
+
+echo 'Extracting paper-matched time series, compute FC, and store in torch file ...'
+python ${proj_dir}src/OCD_symphony/data_preparation/make_torch_files_hcp.py --idx $IDX ${out_args}

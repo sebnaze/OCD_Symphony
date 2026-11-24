@@ -32,11 +32,11 @@ def test_nan_and_missing_values_render_as_dash():
 
 def test_loader_emits_one_load_event_per_file():
     from OCD_symphony.data_preparation.make_hcp_dataset import (
-        DATASET_DIRS, make_hcp_dataset_from_pt,
+        dataset_dirs, make_hcp_dataset_from_pt,
     )
     events = []
     make_hcp_dataset_from_pt(
-        path=DATASET_DIRS["hcp_ya"], label="gender", n_subjs=3,
+        path=dataset_dirs("legacy")["hcp_ya"], label="gender", n_subjs=3, preprocessing="legacy",
         dataset="hcp_ya", num_io_workers=2, progress=events.append,
     )
     assert [e["stage"] for e in events] == ["load"] * 3
@@ -53,7 +53,7 @@ def test_epoch_callback_receives_accuracy_payload():
         fold_idx=None, test_frac=0.15, val_frac=0.15, seed=42, use_wandb=False,
         ddp=False, cv=False, pooling="mean", dropout=0.0, recon_weight=0.0,
         patience=0, encoder_lr=0.0, dapt_ckpt=None, mode="cls", max_abs=1e4,
-        grad_clip=1.0, val_mask_seed=1234,
+        grad_clip=1.0, val_mask_seed=1234, preprocessing="legacy",
     )
     run_single_split(args, epoch_callback=lambda ep, m: events.append((ep, m)))
     assert len(events) == 1

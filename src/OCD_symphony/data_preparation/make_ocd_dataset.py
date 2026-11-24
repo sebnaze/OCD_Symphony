@@ -140,11 +140,12 @@ def make_ocd_dataset_from_pt(label: str, n_subjs=None, max_abs: float = 1e4, **k
     so the caller should not expose a subject-count choice for this dataset.
     """
     from OCD_symphony.data_preparation.make_hcp_dataset import (
-        DATASET_DIRS, make_hcp_dataset_from_pt,
+        dataset_dirs, make_hcp_dataset_from_pt,
     )
+    preprocessing = kwargs.pop("preprocessing", "paper")
     return make_hcp_dataset_from_pt(
-        path=DATASET_DIRS["ocd"], label=label, n_subjs=n_subjs,
-        max_abs=max_abs, dataset="ocd", **kwargs,
+        path=dataset_dirs(preprocessing)["ocd"], label=label, n_subjs=n_subjs,
+        max_abs=max_abs, dataset="ocd", preprocessing=preprocessing, **kwargs,
     )
 
 

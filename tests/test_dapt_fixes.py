@@ -135,7 +135,7 @@ def test_make_dataset_excludes_bad_subject_and_normalises(tmp_path):
     _write_subject(tmp_path, "900198", n_runs=3, nan_fc_runs=(2,), seed=98)
 
     ds, subjs = make_hcp_dataset_from_pt(
-        path=str(tmp_path), label="gender", num_io_workers=2,
+        path=str(tmp_path), label="gender", num_io_workers=2, preprocessing="legacy",
         exclusion_report_path=str(tmp_path / "report" / "excl.json"),
     )
     assert "900199" not in set(subjs)                      # fully corrupt -> excluded

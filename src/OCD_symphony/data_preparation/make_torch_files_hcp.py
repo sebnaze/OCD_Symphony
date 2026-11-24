@@ -12,9 +12,16 @@ import torch
 import zipfile
 
 from OCD_symphony.utils import working_dir, proj_dir, create_log, today
+from OCD_symphony.data_preparation.fmri_cleaning import (
+    CleaningConfig, cleaning_metadata, framewise_displacement_power,
+)
+from OCD_symphony.data_preparation.paper_extraction import (
+    extract_subject_paper, parcellate, prepare_output_dir, update_metadata_dropped,
+)
 
 data_dir = working_dir+'joint_projects/bmh_bigdata/HCP_YA/'
 parc_dir = proj_dir+'/parcellations/'
+demographics_file = os.path.join(proj_dir, 'data/HCP_demographic_data.csv')
 
 # task
 task_list = ['REST']
@@ -110,25 +117,116 @@ def extract_timeseries(subj, window_size=200, logger=logging.getLogger("debug"))
     logger.info(f"Extracted timeseries for {subj} in {t1-t0:.1f}s")
 
 
+# ---------------------------------------------------------------------------
+# Paper-mode extraction (default). Per run: parcellate -> detrend -> band-pass ->
+# motion regression -> FD flagging -> interpolation -> 200-TR windows within the run.
+# ---------------------------------------------------------------------------
+
+PAPER_OUT_DIR = os.path.join(proj_dir, 'data/hcp_paper')
+HCP_TR = 0.72
+# HCP Movement_Regressors.txt rotation columns are on a mm-equivalent scale (see
+# fmri_cleaning.framewise_displacement_power); FD therefore uses radius 1 mm.
+HCP_FD_RADIUS_MM = 1.0
+# (run directory, session index). Session = run index, used for within-run windowing.
+HCP_RUNS = [('rfMRI_REST1_LR', 0), ('rfMRI_REST1_RL', 1), ('rfMRI_REST2_LR', 2), ('rfMRI_REST2_RL', 3)]
+
+
+def hcp_subject_list() -> list:
+    """Subjects with demographics and an extracted MNINonLinear results folder."""
+    import pandas as pd
+    demo = pd.read_csv(demographics_file)['Subject'].astype(str).str.strip().tolist()
+    return sorted(s for s in demo if os.path.isdir(os.path.join(data_dir, s, 'MNINonLinear', 'Results')))
+
+
+def load_hcp_paper_runs(subj: str, logger=logging.getLogger("debug")) -> list:
+    """Parcellate and read motion for each available resting run of one subject."""
+    atlas = ts_parc_dict['schaefer400_tianS3']
+    results = os.path.join(data_dir, subj, 'MNINonLinear', 'Results')
+    runs = []
+    for run_dir, session in HCP_RUNS:
+        base = os.path.join(results, run_dir, run_dir)
+        nifti = base + '_' + preproc_label['REST'] + '.nii.gz'
+        motion_file = os.path.join(results, run_dir, 'Movement_Regressors.txt')
+        if not (os.path.exists(nifti) and os.path.exists(motion_file)):
+            logger.info(f"{subj}: run {run_dir} missing, skipped")
+            continue
+        try:
+            ts = parcellate(nifti, atlas, HCP_TR)
+        except Exception as e:
+            logger.info(f"{subj}: could not extract {run_dir}: {type(e).__name__} - {e}")
+            continue
+        motion = np.loadtxt(motion_file)[:, :6]
+        if motion.shape[0] != ts.shape[1]:
+            logger.info(f"{subj}: {run_dir} motion has {motion.shape[0]} rows, "
+                        f"series {ts.shape[1]} TR, skipped")
+            continue
+        fd = framewise_displacement_power(motion, radius_mm=HCP_FD_RADIUS_MM)
+        runs.append(dict(ts=ts, tr=HCP_TR, fd=fd, confounds=motion, session=session))
+    return runs
+
+
+def hcp_paper_metadata(cfg: CleaningConfig) -> dict:
+    meta = cleaning_metadata(cfg, HCP_TR, sources=dict(
+        data_dir=data_dir, nifti=f"rfMRI_REST*/rfMRI_REST*_{preproc_label['REST']}.nii.gz",
+        motion="rfMRI_REST*/Movement_Regressors.txt", atlas=ts_parc_dict['schaefer400_tianS3']))
+    meta['dataset'] = 'hcp_ya'
+    meta['fd_radius_mm'] = HCP_FD_RADIUS_MM
+    meta['fd_note'] = ("Power FD on the six Movement_Regressors columns with rotation radius 1 mm; "
+                       "L2 match to Movement_RelativeRMS r=0.993 (radius 50 mm gives r=0.62)")
+    return meta
+
+
+def extract_paper(subj: str, out_dir: str, cfg: CleaningConfig, overwrite: bool = False,
+                  logger=logging.getLogger("debug")) -> None:
+    t0 = time()
+    logger.info(f"Extracting paper-mode timeseries for {subj} -> {out_dir}")
+    runs = load_hcp_paper_runs(subj, logger=logger)
+    if not runs:
+        logger.info(f"{subj}: no usable runs, discarded")
+        return
+    extract_subject_paper(subj, runs, out_dir, HCP_TR, cfg, overwrite, logger)
+    logger.info(f"Extracted {subj} in {time()-t0:.1f}s")
+
+
 if __name__ == "__main__":
     logger = create_log("make_torch_files_hcp"+today())
     parser = argparse.ArgumentParser()
     parser.add_argument('--subj', action='store', default=None, help='subject to process')
     parser.add_argument('--n_jobs', action='store', type=int, default=32, help='number of parallel processes')
     parser.add_argument('--idx', action='store', type=int, default=None, help='index in ordered subjects file list')
+    parser.add_argument('--out_dir', action='store', default=PAPER_OUT_DIR,
+                        help='paper-mode output folder (default data/hcp_paper)')
+    parser.add_argument('--overwrite', action='store_true', help='recompute and replace existing outputs')
+    parser.add_argument('--legacy', action='store_true',
+                        help='run the original concatenated-file extraction into data/hcp (unchanged)')
     args = parser.parse_args()
 
-    if ((args.subj == None) and (args.idx == None)):
-        # loop through everyone and run:
-        subj_list = [d for d in os.listdir(data_dir) if os.path.isdir(data_dir+d)]
-        Parallel(n_jobs=args.n_jobs)(delayed(extract_timeseries)(subj, logger=logger) for subj in subj_list)
-    
-    elif (args.subj != None):
-        extract_timeseries(args.subj, logger=logger)
-    
-    elif (args.idx != None):
-        subj = get_hcp_subj(args.idx)
-        if not os.path.exists(os.path.join(proj_dir, 'data/hcp', subj+'.pt')):
-            extract_timeseries(subj, logger=logger)
+    if args.legacy:
+        if ((args.subj == None) and (args.idx == None)):
+            subj_list = [d for d in os.listdir(data_dir) if os.path.isdir(data_dir+d)]
+            Parallel(n_jobs=args.n_jobs)(delayed(extract_timeseries)(subj, logger=logger) for subj in subj_list)
+        elif (args.subj != None):
+            extract_timeseries(args.subj, logger=logger)
+        elif (args.idx != None):
+            subj = get_hcp_subj(args.idx)
+            if not os.path.exists(os.path.join(proj_dir, 'data/hcp', subj+'.pt')):
+                extract_timeseries(subj, logger=logger)
+            else:
+                logger.info(f"Subject {subj} was already processed, did not reprocess.")
+    else:
+        cfg = CleaningConfig()
+        prepare_output_dir(args.out_dir, hcp_paper_metadata(cfg), overwrite=args.overwrite)
+        all_subjs = hcp_subject_list()
+        if args.subj is not None:
+            subj_list = [args.subj]
+        elif args.idx is not None:
+            subj_list = [all_subjs[args.idx]]
         else:
-            logger.info(f"Subject {subj} was already processed, did not reprocess.")
+            subj_list = all_subjs
+        if len(subj_list) == 1:
+            extract_paper(subj_list[0], args.out_dir, cfg, args.overwrite, logger=logger)
+        else:
+            Parallel(n_jobs=args.n_jobs)(
+                delayed(extract_paper)(subj, args.out_dir, cfg, args.overwrite, logger)
+                for subj in subj_list)
+        update_metadata_dropped(args.out_dir)

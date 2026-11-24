@@ -62,11 +62,33 @@ OCD_DIR = os.path.join(proj_dir, "data/OCDbaseline_fmriprep_MNI152NLin2009cAsym_
 HCP_DEMOGRAPHICS = os.path.join(proj_dir, "data/HCP_demographic_data.csv")
 OCD_DEMOGRAPHICS = os.path.join(proj_dir, "data/demographics.csv")
 
+# Preprocessing modes.
+#   paper  (default): ROI series cleaned as in BrainSymphony S1.1 (see fmri_cleaning.py);
+#                     normalisation (x - median) / IQR per ROI, no sigma division, no window demeaning.
+#   legacy: the original pipeline and files (sigma_robust division, OCD per-window demeaning).
+PREPROCESSING_MODES = ("paper", "legacy")
+PAPER_DATASET_DIRS = {"hcp_ya": os.path.join(proj_dir, "data/hcp_paper"),
+                      "ocd": os.path.join(proj_dir, "data/OCD_paper")}
+LEGACY_DATASET_DIRS = {"hcp_ya": HCP_YA_DIR, "ocd": OCD_DIR}
+
 # HCP-YA age is only available as bins. Regression uses the bin midpoint. The open-ended
 # "36+" bin has no true midpoint, so 38 is an assumed value.
 HCP_AGE_MIDPOINTS = {"22-25": 23.5, "26-30": 28.0, "31-35": 33.0, "36+": 38.0}
 
-DATASET_DIRS = {"hcp_ya": HCP_YA_DIR, "ocd": OCD_DIR}
+# Default (paper-mode) folders. Use dataset_dirs(preprocessing) to select explicitly.
+DATASET_DIRS = PAPER_DATASET_DIRS
+
+
+def check_preprocessing(preprocessing: str) -> str:
+    if preprocessing not in PREPROCESSING_MODES:
+        raise ValueError(f"preprocessing must be one of {PREPROCESSING_MODES}, got {preprocessing!r}")
+    return preprocessing
+
+
+def dataset_dirs(preprocessing: str = "paper") -> Dict[str, str]:
+    """Folder of the .pt files for each dataset under the given preprocessing mode."""
+    check_preprocessing(preprocessing)
+    return PAPER_DATASET_DIRS if preprocessing == "paper" else LEGACY_DATASET_DIRS
 # Datasets whose windows are demeaned per ROI before normalisation (see preprocess_windows).
 WINDOW_DEMEAN_DATASETS = {"ocd"}
 DATASET_TAGS = {"hcp_ya": "HCP_YA", "ocd": "OCD"}
@@ -142,7 +164,8 @@ def preprocess_windows(fmri: torch.Tensor, dataset: str) -> torch.Tensor:
     return fmri
 
 
-def _load_raw_file(fname: str, max_abs: float = 1e4, dataset: str = "hcp_ya") -> Dict:
+def _load_raw_file(fname: str, max_abs: float = 1e4, dataset: str = "hcp_ya",
+                   preprocessing: str = "paper") -> Dict:
     """
     Load one .pt file from disk and return minimally reshaped tensors + metadata.
     No normalisation or ROI reindexing yet – those happen once on the full batch.
@@ -204,7 +227,8 @@ def _load_raw_file(fname: str, max_abs: float = 1e4, dataset: str = "hcp_ya") ->
         if n_keep < n:
             fmri, fc = fmri[keep], fc[keep]
 
-        fmri = preprocess_windows(fmri, dataset)
+        if preprocessing == "legacy":
+            fmri = preprocess_windows(fmri, dataset)
         meta = load_subject_metadata(dataset, subj)
         return dict(
             fmri=fmri,
@@ -399,6 +423,7 @@ def make_hcp_dataset_from_pt(
     quantile_seed: int = 0,        # seed for the quantile sub-sampling (reproducible stats)
     exclusion_report_path: Optional[str] = None,  # default: results/data_exclusions.json
     dataset:     str = "hcp_ya",  # "hcp_ya" or "ocd" (selects demographics and labels)
+    preprocessing: str = "paper",  # "paper" (default) or "legacy" (see PREPROCESSING_MODES)
     progress=None,  # optional callback: {"stage": "load", "done", "total"} per file (display only)
 ) -> Tuple[FMRIDataset, np.ndarray]:
     """
@@ -452,11 +477,12 @@ def make_hcp_dataset_from_pt(
     print(f"Found {len(fnames)} files to load.")
     # Every selected subject needs demographics; fail before reading any tensor.
     check_metadata_coverage(dataset, [os.path.basename(f)[:-3] for f in fnames])
+    check_preprocessing(preprocessing)
 
     # ── 2. Parallel file load ─────────────────────────────────────────────────
     records: List[Dict] = []
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
-        futures = {ex.submit(_load_raw_file, f, max_abs, dataset): f for f in fnames}
+        futures = {ex.submit(_load_raw_file, f, max_abs, dataset, preprocessing): f for f in fnames}
         for done, fut in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Loading files"), start=1):
             rec = fut.result()
             if rec is not None:
@@ -531,13 +557,18 @@ def make_hcp_dataset_from_pt(
     del fmri_flat                                                 # free ~3 GB
 
     # ── 6. Compute W, B and normalise ─────────────────────────────────────────
-    mu_robust    = (raw_mu - median) / iqr
-    sigma_robust = raw_std / iqr
-    sigma_robust = np.where(sigma_robust == 0, 1e-8, sigma_robust)
+    if preprocessing == "paper":
+        # Paper S1.1: x' = (x - median) / IQR per ROI. No sigma division.
+        W = torch.from_numpy(1.0 / iqr).float()                  # (450,)
+        B = torch.from_numpy(-median / iqr).float()              # (450,)
+    else:
+        mu_robust    = (raw_mu - median) / iqr
+        sigma_robust = raw_std / iqr
+        sigma_robust = np.where(sigma_robust == 0, 1e-8, sigma_robust)
 
-    denom = iqr * sigma_robust
-    W = torch.from_numpy(1.0 / denom).float()                    # (450,)
-    B = torch.from_numpy((-median / denom) - (mu_robust / sigma_robust)).float()
+        denom = iqr * sigma_robust
+        W = torch.from_numpy(1.0 / denom).float()                # (450,)
+        B = torch.from_numpy((-median / denom) - (mu_robust / sigma_robust)).float()
 
     print("Applying normalisation …")
     all_fmri = all_fmri * W.reshape(1, -1, 1) + B.reshape(1, -1, 1)
@@ -545,21 +576,51 @@ def make_hcp_dataset_from_pt(
     # ── 6b. Post-normalisation sanity check ───────────────────────────────────
     # A single corrupted subject inflates the pooled statistics and silently
     # squashes everyone else towards zero; fail loudly instead.
-    norm_std = all_fmri.std(dim=(0, 2))                            # (450,) per-ROI
     norm_absmax = all_fmri.abs().max().item()
-    if (
-        not torch.isfinite(norm_std).all()
-        or norm_std.min().item() < 0.5
-        or norm_std.max().item() > 2.0
-        or norm_absmax > 200.0
-    ):
-        raise RuntimeError(
-            "Normalised fMRI failed the sanity check "
-            f"(per-ROI std in [{norm_std.min().item():.3g}, {norm_std.max().item():.3g}], "
-            f"|x|max={norm_absmax:.3g}); expected std≈1 and |x|max<200. "
-            "Likely cause: an outlier subject/run slipped past validation "
-            f"(current max_abs={max_abs:g}). Lower --max_abs or inspect the raw files."
-        )
+    if preprocessing == "paper":
+        # Median/IQR scaling fixes the location and IQR per ROI by construction, so this checks
+        # that W/B were applied correctly. Gaussian-like data has std ≈ 0.74 after this scaling
+        # (σ = IQR / 1.349), so std is only range-checked, with wider bounds than legacy.
+        sub = all_fmri.permute(1, 0, 2).reshape(450, -1)
+        if sub.shape[1] > 200_000:
+            gen = torch.Generator().manual_seed(quantile_seed)
+            sub = sub[:, torch.randperm(sub.shape[1], generator=gen)[:200_000]]
+        q_norm = torch.quantile(sub, torch.tensor([0.25, 0.5, 0.75]), dim=1)
+        norm_median = q_norm[1]
+        norm_iqr = q_norm[2] - q_norm[0]
+        norm_std = all_fmri.std(dim=(0, 2))                        # (450,) per-ROI
+        if (
+            not torch.isfinite(norm_std).all()
+            or norm_median.abs().max().item() > 0.05
+            or (norm_iqr - 1.0).abs().max().item() > 0.05
+            or norm_std.min().item() < 0.3
+            or norm_std.max().item() > 3.0
+            or norm_absmax > 200.0
+        ):
+            raise RuntimeError(
+                "Normalised fMRI (paper mode) failed the sanity check: "
+                f"per-ROI |median| max={norm_median.abs().max().item():.3g}, "
+                f"|IQR-1| max={(norm_iqr - 1.0).abs().max().item():.3g}, "
+                f"std in [{norm_std.min().item():.3g}, {norm_std.max().item():.3g}], "
+                f"|x|max={norm_absmax:.3g}. Expected median≈0, IQR≈1, std≈0.74 (Gaussian-like), "
+                "|x|max<200. Likely cause: an outlier subject/run or a corrupted extraction; "
+                "inspect the raw files or the metadata of the dataset folder."
+            )
+    else:
+        norm_std = all_fmri.std(dim=(0, 2))                        # (450,) per-ROI
+        if (
+            not torch.isfinite(norm_std).all()
+            or norm_std.min().item() < 0.5
+            or norm_std.max().item() > 2.0
+            or norm_absmax > 200.0
+        ):
+            raise RuntimeError(
+                "Normalised fMRI failed the sanity check "
+                f"(per-ROI std in [{norm_std.min().item():.3g}, {norm_std.max().item():.3g}], "
+                f"|x|max={norm_absmax:.3g}); expected std≈1 and |x|max<200. "
+                "Likely cause: an outlier subject/run slipped past validation "
+                f"(current max_abs={max_abs:g}). Lower --max_abs or inspect the raw files."
+            )
 
     # ── 7. G_tensor placeholder ───────────────────────────────────────────────
     all_G = torch.randn(N, 450, 10)
@@ -578,6 +639,7 @@ def make_hcp_dataset_from_pt(
         conditions=all_conds if dataset == "ocd" else None,
     )
     ds.dataset = dataset
+    ds.preprocessing = preprocessing
     ds.exclusion_report = exclusion_report
     # Per-ROI affine normalisation (x -> W*x + B) fitted on the full dataset; exposed so
     # subsets can be normalised identically without reloading every subject.
