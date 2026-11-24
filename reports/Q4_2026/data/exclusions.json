@@ -1,0 +1,36 @@
+{
+  "note": "Copied from the data-validation log lines of the probe runs (Nov 19). results/data_exclusions.json is overwritten by every dataset load, so it is not a reliable source for both cohorts.",
+  "hcp_ya": {
+    "loaded_files": 500,
+    "used_subjects": 499,
+    "excluded": [
+      {
+        "run": "ALL",
+        "reason": "all 24 runs invalid (fMRI |max|=1.96e+36 > 10000; non-finite FC)"
+      },
+      {
+        "run": 18,
+        "reason": "non-finite FC (one run dropped, subject kept)"
+      }
+    ]
+  },
+  "ocd": {
+    "loaded_files": 98,
+    "used_subjects": 97,
+    "excluded": [
+      {
+        "run": "ALL",
+        "reason": "all 4 runs invalid (fMRI |max|=1.29e+04 > 10000)"
+      }
+    ],
+    "label_counts_condition": {
+      "HC": 44,
+      "OCD": 53
+    },
+    "intro_claim": {
+      "OCD": 52,
+      "controls": 48,
+      "total": 100
+    }
+  }
+}

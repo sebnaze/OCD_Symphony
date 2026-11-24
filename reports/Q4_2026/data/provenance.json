@@ -1,0 +1,25 @@
+{
+  "checkpoint_A": {
+    "path": "models/dapt_HCP_YA_gender_dapt_mS0.70_mT0.70_mC0.50_lr5e-05_dapt.pth",
+    "source_run": "results/runs/gender_dapt_mS0.70_mT0.70_mC0.50_lr5e-05_dapt_uc58rue5.json",
+    "verified": true,
+    "checks": {
+      "file_mtime": "2026-11-03 07:16:40.621751 (checkpoint)",
+      "run_json_mtime": "2026-11-03 07:16:40.623815 (uc58rue5 run)",
+      "ckpt_epoch": 30,
+      "ckpt_val_loss": 2.114947856884997,
+      "run_final_val_recon": 2.114947856884997,
+      "ckpt_args_n_subjs": 500,
+      "ckpt_args_n_epochs": 30,
+      "ckpt_args_dapt_mask_ratio_spatial": 0.7,
+      "ckpt_args_dapt_mask_ratio_temporal": 0.7,
+      "ckpt_args_dapt_mask_ratio_context": 0.5,
+      "ckpt_args_learning_rate": 5e-05,
+      "ckpt_args_seed": 42
+    },
+    "rejected_candidates": [
+      "gender_dapt_mS0.70_mT0.70_mC0.50_lr5e-05_dapt_20261102_112038.json (final val_recon 27.61, 200 subjects, 10 epochs)",
+      "gender_dapt_mS0.70_mT0.70_mC0.50_lr5e-05_dapt_20261103_021255.json (final val_recon 3.47, 50 subjects, 3 epochs)"
+    ]
+  }
+}

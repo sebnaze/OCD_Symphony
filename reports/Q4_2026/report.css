@@ -1,0 +1,10 @@
+/* Markdown text: marimo caps .prose at 65ch (about half of a full-screen window).
+   Let it fill the same width as the rest of the notebook. */
+.prose {
+  max-width: none;
+}
+
+/* Plotly figures: 2/3 of the available width, still responsive to the window size. */
+.js-plotly-plot {
+  width: 66.67% !important;
+}
