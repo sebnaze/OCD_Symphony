@@ -156,7 +156,7 @@ def read_confounds(path: str):
     import pandas as pd
     df = pd.read_csv(path, sep='\t', usecols=['framewise_displacement'] + MOTION_COLUMNS)
     motion = df[MOTION_COLUMNS].to_numpy(dtype=np.float64)
-    fd = pd.to_numeric(df['framewise_displacement'], errors='coerce').to_numpy(dtype=np.float64)
+    fd = pd.to_numeric(df['framewise_displacement'], errors='coerce').to_numpy(dtype=np.float64, copy=True)
     fd[0] = 0.0  # first volume has no previous frame; fMRIPrep writes n/a
     return motion, fd
 
