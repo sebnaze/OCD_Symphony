@@ -28,6 +28,7 @@ from OCD_symphony.utils import proj_dir
 from OCD_symphony.data_preparation.make_hcp_dataset import (
     DATASET_DIRS,
     WINDOW_DEMEAN_DATASETS,
+    dataset_dirs,
     FMRIDataset,
     _load_raw_file,
     make_hcp_dataset_from_pt,
@@ -60,14 +61,19 @@ _ROI_INDS = torch.from_numpy(np.concatenate([
 
 
 def _cache_key(n_subjs: Optional[int], max_abs: float, test_frac: float,
-               val_frac: float, seed: int, dataset: str = "hcp_ya") -> str:
+               val_frac: float, seed: int, dataset: str = "hcp_ya",
+               preprocessing: str = "paper") -> str:
     """Stable key for cached files; any change of data/split args gives a new key.
 
-    HCP-YA keeps the legacy key format so existing caches stay valid.
+    Legacy HCP-YA and legacy OCD keep their original key format so existing caches stay valid.
+    Paper-mode statistics always carry a ``preprocessing`` entry, so they never reuse legacy caches.
     """
     cfg = dict(n_subjs=n_subjs, max_abs=max_abs, test_frac=test_frac, val_frac=val_frac, seed=seed)
     if dataset != "hcp_ya":
         cfg["dataset"] = dataset
+    if preprocessing == "paper":
+        cfg["preprocessing"] = "paper"
+    elif dataset != "hcp_ya":
         # Bumped whenever the preprocessing changes, so stale statistics are never reused.
         cfg["preprocess"] = "window_demean_v1" if dataset in WINDOW_DEMEAN_DATASETS else "none"
     digest = hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
@@ -85,6 +91,7 @@ def fit_normalisation_stats(
     dataset: str = "hcp_ya",
     progress=None,
     split_protocol: str = "subject",
+    preprocessing: str = "paper",
 ) -> Dict[str, np.ndarray]:
     """Return ``{"W", "B", "test_subjs"}`` for the reconstruction data configuration.
 
@@ -99,7 +106,7 @@ def fit_normalisation_stats(
     """
     if dataset == "ocd":
         n_subjs = None
-    key = _cache_key(n_subjs, max_abs, test_frac, val_frac, seed, dataset)
+    key = _cache_key(n_subjs, max_abs, test_frac, val_frac, seed, dataset, preprocessing)
     if split_protocol == "sample":
         key += "_sample"
     path = os.path.join(RESULTS_DIR, f"dapt_recon_stats_{key}.npz")
@@ -108,8 +115,8 @@ def fit_normalisation_stats(
         return {"W": d["W"], "B": d["B"], "test_subjs": d["test_subjs"]}
 
     dataset_obj, _ = make_hcp_dataset_from_pt(
-        path=DATASET_DIRS[dataset], label=RECON_SPLIT_LABEL[dataset], n_subjs=n_subjs,
-        max_abs=max_abs, dataset=dataset, progress=progress,
+        path=dataset_dirs(preprocessing)[dataset], label=RECON_SPLIT_LABEL[dataset], n_subjs=n_subjs,
+        max_abs=max_abs, dataset=dataset, preprocessing=preprocessing, progress=progress,
     )
     _, _, testset = split_train_val_test(
         dataset_obj, test_frac=test_frac, val_frac=val_frac, seed=seed, protocol=split_protocol,
@@ -264,15 +271,16 @@ def default_device() -> torch.device:
 
 
 def load_subjects_normalised(subject_ids: List[str], W, B, max_abs: float = 1e4,
-                             num_io_workers: int = 8, dataset: str = "hcp_ya") -> FMRIDataset:
+                             num_io_workers: int = 8, dataset: str = "hcp_ya",
+                             preprocessing: str = "paper") -> FMRIDataset:
     """Read only ``subject_ids`` from ``dataset``, reindex ROIs and apply the global (W, B).
 
     Same transform as ``make_hcp_dataset_from_pt`` steps 3-6, so inputs match training.
     """
-    data_dir = DATASET_DIRS[dataset]
+    data_dir = dataset_dirs(preprocessing)[dataset]
     fnames = [os.path.join(data_dir, f"{s}.pt") for s in subject_ids]
     with ThreadPoolExecutor(max_workers=num_io_workers) as ex:
-        records = list(ex.map(lambda f: _load_raw_file(f, max_abs, dataset), fnames))
+        records = list(ex.map(lambda f: _load_raw_file(f, max_abs, dataset, preprocessing), fnames))
     records = sorted((r for r in records if not r.get("excluded")), key=lambda r: r["subj"])
     if not records:
         raise RuntimeError("None of the selected subjects passed validation.")
@@ -330,7 +338,8 @@ def release_gpu_memory() -> None:
 
 
 def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, device,
-                     dataset: str = "hcp_ya", return_latents: bool = False):
+                     dataset: str = "hcp_ya", return_latents: bool = False,
+                     preprocessing: str = "paper"):
     """Yield ``(orig, recon, fc_in[, latents])`` numpy batches for one subject, masking off.
 
     ``orig``/``recon`` are (n, R, T) BOLD windows; ``fc_in`` is the stored input FC (n, R, R)
@@ -339,7 +348,8 @@ def _forward_subject(models, sid: str, W, B, max_abs: float, batch_size: int, de
     Perceiver call that produces ``recon``, so no extra forward pass is needed.
     """
     spatial_model, temporal_model, conv_model, perceiver = models
-    ds = load_subjects_normalised([sid], W, B, max_abs=max_abs, dataset=dataset)
+    ds = load_subjects_normalised([sid], W, B, max_abs=max_abs, dataset=dataset,
+                                  preprocessing=preprocessing)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     for fmri, fc, gm, _label in loader:
         fmri = fmri.to(device, non_blocking=True).float()
@@ -417,6 +427,7 @@ def reconstruct_subject_stats(
     geometry_baseline: bool = False,
     max_windows_per_subject: Optional[int] = None,
     seed: int = 0,
+    preprocessing: str = "paper",
 ) -> Dict[str, object]:
     """Reconstruct ``subject_ids`` and return aggregate statistics plus traces for a
     small set of representative subjects. The GPU models are released before returning.
@@ -475,7 +486,7 @@ def reconstruct_subject_stats(
             fc_acc = None  # (input FCAccumulator, reconstructed FCAccumulator)
             lat_rows: List[np.ndarray] = []
             for batch in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset,
-                                          return_latents=geometry):
+                                          return_latents=geometry, preprocessing=preprocessing):
                 o, r, fc_in = batch[:3]
                 if geometry:
                     lat_rows.append(batch[3])
@@ -530,7 +541,7 @@ def reconstruct_subject_stats(
             for sid in subject_ids:
                 rows: List[np.ndarray] = []
                 for batch in _forward_subject(rand_models, sid, W, B, max_abs, batch_size, device,
-                                              dataset, return_latents=True):
+                                              dataset, return_latents=True, preprocessing=preprocessing):
                     rows.append(batch[3])
                 if rows:
                     lat_sub = _cap_windows(np.concatenate(rows, axis=0), max_windows_per_subject)
@@ -565,7 +576,8 @@ def reconstruct_subject_stats(
         for sid in representative:
             o_list, r_list = [], []
             fc_acc = None
-            for o, r, fc_in in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset):
+            for o, r, fc_in in _forward_subject(models, sid, W, B, max_abs, batch_size, device, dataset,
+                                                preprocessing=preprocessing):
                 o_list.append(o)
                 r_list.append(r)
                 if fc_acc is None:
