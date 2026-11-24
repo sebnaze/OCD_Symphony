@@ -104,11 +104,22 @@ def _(mo):
     )
     # Stage -1 features are aggregated per subject, so the sample-level protocol does not apply.
     # The row is rendered in the next cell: marimo forbids reading a widget's value in the cell that created it.
-    return dataset_selector, scope_selector, split_protocol_selector, stage_selector
+    return (
+        dataset_selector,
+        scope_selector,
+        split_protocol_selector,
+        stage_selector,
+    )
 
 
 @app.cell
-def _(mo, dataset_selector, scope_selector, split_protocol_selector, stage_selector):
+def _(
+    dataset_selector,
+    mo,
+    scope_selector,
+    split_protocol_selector,
+    stage_selector,
+):
     # Block 1 row: stage, dataset, and the split protocol (hidden for Stage -1 and for
     # subject-level target scope, which always uses subject folds).
     _row = [stage_selector, dataset_selector]
@@ -166,7 +177,14 @@ def _():
 
 
 @app.cell
-def _(dataset_selector, find_ckpt, mo, run_metas, scope_selector, stage_selector):
+def _(
+    dataset_selector,
+    find_ckpt,
+    mo,
+    run_metas,
+    scope_selector,
+    stage_selector,
+):
     # ── Block 2 widgets: rebuilt on stage / dataset change so defaults follow them ──
     _stage_defaults = {
         "fc_baseline": dict(epochs=10, lr=1e-4, perceiver_lr=1e-6, encoder_lr=0.0),
@@ -235,13 +253,10 @@ def _(dataset_selector, find_ckpt, mo, run_metas, scope_selector, stage_selector
         label="Target Label",
     )
     # Stage -1 only: which FC-derived feature set the subject-level classifier uses.
-    fc_feature_radio = mo.ui.radio(
-        options={"FC network blocks (36 values)": "fc_network",
-                 "FC full upper triangle (PCA 256)": "fc_full",
-                 "FC full upper triangle (no PCA, 101,025 features)": "fc_full_raw"},
-        value="FC network blocks (36 values)",
-        label="Feature set",
-    )
+    # One checkbox per feature set. Every ticked set runs sequentially (one fit each).
+    fc_feat_network = mo.ui.checkbox(value=True, label="FC network blocks (36 values)")
+    fc_feat_full = mo.ui.checkbox(value=False, label="FC full upper triangle (PCA 256)")
+    fc_feat_full_raw = mo.ui.checkbox(value=False, label="FC full upper triangle (no PCA, 101,025 features)")
     # Stage 1/2 starting weights: HCP-Aging baseline (None) or any DAPT run.
     init_selector = mo.ui.dropdown(
         options={"HCP-AGING (baseline)": None, **_dapt_opts},
@@ -260,17 +275,11 @@ def _(dataset_selector, find_ckpt, mo, run_metas, scope_selector, stage_selector
         label="Evaluation Mode",
     )
     # Stage 0 only: how Perceiver latents are reduced before the logistic regression.
-    probe_pooling_radio = mo.ui.radio(
-        options={
-            "PCA (256 components)": "pca",
-            "Per feature (mean over ROIs)": "feature",
-            "Per ROI (mean over features)": "roi",
-            "Per network (mean over ROIs per network)": "network",
-            "All (sequential)": "all",
-        },
-        value="PCA (256 components)",
-        label="Pooling",
-    )
+    # One checkbox per pooling mode. Every ticked mode runs sequentially (one fit each).
+    probe_pool_pca = mo.ui.checkbox(value=True, label="PCA (256 components)")
+    probe_pool_feature = mo.ui.checkbox(value=False, label="Per feature (mean over ROIs)")
+    probe_pool_roi = mo.ui.checkbox(value=False, label="Per ROI (mean over features)")
+    probe_pool_network = mo.ui.checkbox(value=False, label="Per network (mean over ROIs per network)")
     fold_slider = mo.ui.slider(
         start=0,
         stop=4,
@@ -409,30 +418,35 @@ def _(dataset_selector, find_ckpt, mo, run_metas, scope_selector, stage_selector
         batch_size_dropdown,
         dapt_ckpt_name_input,
         dapt_init_selector,
+        dapt_loss_radio,
         dapt_mask_context_slider,
         dapt_mask_spatial_slider,
         dapt_mask_temporal_slider,
-        dapt_loss_radio,
         dapt_weights_input,
         dropout_slider,
         encoder_lr_dropdown,
         epochs_slider,
-        fc_feature_radio,
+        fc_feat_full,
+        fc_feat_full_raw,
+        fc_feat_network,
         fold_slider,
         init_selector,
         label_selector,
         lr_dropdown,
         mode_selector,
-        post_ckpt_selector,
+        perm_n_input,
         pooling_selector,
+        post_ckpt_selector,
         probe_eval_radio,
         probe_init_selector,
-        probe_pooling_radio,
+        probe_pool_feature,
+        probe_pool_network,
+        probe_pool_pca,
+        probe_pool_roi,
         recon_slider,
         run_btn,
         seed_input,
         shuffle_checkbox,
-        perm_n_input,
         subjs_input,
         vicreg_weight_dropdown,
         wandb_checkbox,
@@ -445,37 +459,42 @@ def _(
     batch_size_dropdown,
     dapt_ckpt_name_input,
     dapt_init_selector,
+    dapt_loss_radio,
     dapt_mask_context_slider,
     dapt_mask_spatial_slider,
     dapt_mask_temporal_slider,
     dapt_weights_input,
+    dataset_selector,
     dropout_slider,
     encoder_lr_dropdown,
     epochs_slider,
+    fc_feat_full,
+    fc_feat_full_raw,
+    fc_feat_network,
     fold_slider,
+    init_selector,
     label_selector,
     lr_dropdown,
     mo,
     mode_selector,
-    post_ckpt_selector,
+    perm_n_input,
     pooling_selector,
+    post_ckpt_selector,
     probe_eval_radio,
     probe_init_selector,
-    probe_pooling_radio,
+    probe_pool_feature,
+    probe_pool_network,
+    probe_pool_pca,
+    probe_pool_roi,
     recon_slider,
     run_btn,
+    scope_selector,
     seed_input,
     shuffle_checkbox,
-    perm_n_input,
-    dataset_selector,
-    init_selector,
     stage_selector,
     subjs_input,
-    wandb_checkbox,
-    fc_feature_radio,
-    scope_selector,
-    dapt_loss_radio,
     vicreg_weight_dropdown,
+    wandb_checkbox,
 ):
     # ── Block 2 view: only the parameters relevant to the selected stage ─────
     _stage = stage_selector.value
@@ -563,7 +582,7 @@ def _(
                 "Splits match Stage 0 for the same seed, so the two can be compared directly."
             ),
             mo.hstack([label_selector], justify="start", wrap=True),
-            mo.hstack([fc_feature_radio], justify="start"),
+            mo.hstack([fc_feat_network, fc_feat_full, fc_feat_full_raw], justify="start", wrap=True),
             mo.hstack([probe_eval_radio], justify="start"),
             mo.hstack([*([] if _is_ocd else [subjs_input]), seed_input], justify="start", wrap=True),
             mo.hstack([shuffle_checkbox, perm_n_input], justify="start", wrap=True),
@@ -587,7 +606,8 @@ def _(
                 "8 networks, leaving 8 × 128 = 1024 values."
             ),
             mo.hstack([label_selector, scope_selector, probe_init_selector], justify="start", wrap=True),
-            mo.hstack([probe_pooling_radio], justify="start"),
+            mo.hstack([probe_pool_pca, probe_pool_feature, probe_pool_roi, probe_pool_network],
+                      justify="start", wrap=True),
             mo.hstack([probe_eval_radio], justify="start"),
             mo.hstack([*([] if _is_ocd else [subjs_input]), seed_input], justify="start", wrap=True),
             mo.hstack([shuffle_checkbox, perm_n_input], justify="start", wrap=True),
@@ -608,40 +628,47 @@ def _(
     clean_gpu_memory,
     dapt_ckpt_name_input,
     dapt_init_selector,
+    dapt_loss_radio,
     dapt_mask_context_slider,
     dapt_mask_spatial_slider,
     dapt_mask_temporal_slider,
     dapt_weights_input,
+    dataset_selector,
     dropout_slider,
     encoder_lr_dropdown,
     epochs_slider,
+    fc_feat_full,
+    fc_feat_full_raw,
+    fc_feat_network,
     fold_slider,
+    init_selector,
     label_selector,
     lr_dropdown,
     mo,
     mode_selector,
-    post_ckpt_selector,
+    perm_n_input,
     pooling_selector,
+    post_ckpt_selector,
     probe_eval_radio,
     probe_init_selector,
-    probe_pooling_radio,
+    probe_pool_feature,
+    probe_pool_network,
+    probe_pool_pca,
+    probe_pool_roi,
     recon_slider,
     run_btn,
     run_cross_validation,
     run_dapt,
     run_single_fold,
     run_single_split,
-    dataset_selector,
-    init_selector,
+    scope_selector,
     seed_input,
+    shuffle_checkbox,
+    split_protocol_selector,
     stage_selector,
     subjs_input,
-    wandb_checkbox,
-    fc_feature_radio,
-    split_protocol_selector,
-    scope_selector,
-    dapt_loss_radio,
     vicreg_weight_dropdown,
+    wandb_checkbox,
 ):
     # Outputs are always defined so downstream cells can read them before
     # training starts. Marimo compiles each cell body on its own, so an early
@@ -652,7 +679,24 @@ def _(
     dapt_ckpt_path = None
 
     # Stage 3.2 needs a DAPT checkpoint; without one, Start does nothing.
-    _blocked = stage_selector.value == "stage3_2" and post_ckpt_selector.value is None
+    # Stage 0 / Stage -1 need at least one ticked pooling mode / feature set.
+    _pool_sel = [
+        _k for _k, _c in (
+            ("pca", probe_pool_pca), ("feature", probe_pool_feature),
+            ("roi", probe_pool_roi), ("network", probe_pool_network),
+        ) if _c.value
+    ]
+    _fc_sel = [
+        _k for _k, _c in (
+            ("fc_network", fc_feat_network), ("fc_full", fc_feat_full),
+            ("fc_full_raw", fc_feat_full_raw),
+        ) if _c.value
+    ]
+    _blocked = (
+        (stage_selector.value == "stage3_2" and post_ckpt_selector.value is None)
+        or (stage_selector.value == "probe" and not _pool_sel)
+        or (stage_selector.value == "fc_baseline" and not _fc_sel)
+    )
     if run_btn.value and not _blocked:
         clean_gpu_memory()
 
@@ -804,7 +848,7 @@ def _(
                             n_folds=5,
                             max_abs=1e4,
                             probe_eval=str(probe_eval_radio.value),
-                            feature_set=str(fc_feature_radio.value),
+                            feature_set=_fc_sel[0],  # overwritten per ticked feature set below
                             n_permutations=int(perm_n_input.value or 0),
                             shuffle_labels=bool(shuffle_checkbox.value),
                         )
@@ -820,7 +864,7 @@ def _(
                             n_folds=5,
                             max_abs=1e4,
                             probe_eval=str(probe_eval_radio.value),
-                            pooling=str(probe_pooling_radio.value),
+                            pooling=list(_pool_sel),
                             dapt_ckpt=probe_init_selector.value,
                             split_protocol=split_protocol,
                             target_scope=target_scope,
@@ -834,12 +878,15 @@ def _(
                     _MODE_NAMES = {"pca": "PCA", "feature": "Per feature", "roi": "Per ROI", "network": "Per network"}
 
                     def _on_probe_event(ev, _bars=_bars, _stack=_stack, _n_folds=probe_args.n_folds):
-                        # Logistic-regression events carry the pooling mode ("All" runs several in turn).
+                        # Each ticked pooling mode / feature set runs in turn; its events carry a run tag
+                        # so every run gets its own bars. Logistic-regression events also carry the pooling mode.
                         _mode = ev.get("mode")
-                        _suffix = f" · {_MODE_NAMES[_mode]}" if _mode else ""
-                        _pre = f"{_mode}-" if _mode else ""
+                        _run = ev.get("run")
+                        _label = _MODE_NAMES.get(_mode, _mode) if _mode else _run
+                        _suffix = f" · {_label}" if _label else ""
+                        _pre = f"{_run}-" if _run else ""
                         if ev["stage"] == "extract":
-                            key, title = "extract", "Extracting latents"
+                            key, title = f"{_pre}extract", "Extracting latents"
                         elif ev["stage"] == "split":
                             key, title = f"{_pre}split", f"Logistic regression (split){_suffix}"
                         else:
@@ -852,12 +899,23 @@ def _(
                             _bars[key].update(increment=1)
 
                     try:
-                        _res = _run_stage(probe_args, progress=_on_probe_event)
-                        # "All" returns [(payload, path), ...] in mode order; a single mode returns (payload, path).
-                        if isinstance(_res, list):
-                            probe_payload = [_p for _p, _ in _res]
+                        if is_fc_mode:
+                            # FC baseline: one fit per ticked feature set (no encoder, nothing to share).
+                            _payloads = []
+                            for _key in _fc_sel:
+                                probe_args.feature_set = _key
+                                _res = _run_stage(
+                                    probe_args,
+                                    progress=lambda ev, _k=_key: _on_probe_event({**ev, "run": _k}),
+                                )
+                                _payloads.append(_res[0])  # (payload, saved_json_path) per run
+                            probe_payload = _payloads[0] if len(_payloads) == 1 else _payloads
                         else:
-                            probe_payload, _probe_path = _res
+                            # Stage 0: one call for all ticked pooling modes. Latents are extracted once
+                            # and every mode is pooled from them; returns [(payload, path), ...] in order.
+                            probe_args.pooling = list(_pool_sel)
+                            _res = _run_stage(probe_args, progress=_on_probe_event)
+                            probe_payload = [_p for _p, _ in _res]
                     finally:
                         _stack.close()
                 elif is_dapt:
@@ -876,7 +934,7 @@ def _(
 
         config = None if (is_probe_mode or is_fc_mode) else vars(args)
 
-    return config, history, test_acc, test_f1, probe_payload, dapt_ckpt_path
+    return config, dapt_ckpt_path, history, probe_payload, test_acc, test_f1
 
 
 @app.cell
@@ -1874,7 +1932,7 @@ def _(find_ckpt, get_loaded_for, mo, run_metas, set_loaded_ckpt):
             else:
                 set_loaded_ckpt(_ck)
     _load_view
-
+    return
 
 
 @app.cell
@@ -1897,7 +1955,7 @@ def _(dapt_ckpt_path, mo, set_loaded_ckpt):
         else:
             set_loaded_ckpt(dapt_ckpt_path)
     _handoff_view
-
+    return
 
 
 @app.cell
@@ -1921,8 +1979,8 @@ def _(
     get_recon_cache,
     get_recon_clicks,
     mo,
-    recon_fraction,
     recon_dataset,
+    recon_fraction,
     recon_geometry,
     recon_geometry_baseline,
     recon_run_btn,
@@ -2166,13 +2224,7 @@ def _(
 
 
 @app.cell
-def _(
-    fig_to_png,
-    mo,
-    recon_plot_width,
-    recon_result,
-    recon_subject,
-):
+def _(fig_to_png, mo, recon_plot_width, recon_result, recon_subject):
     # ── Subject-level FC: reconstructed BOLD vs input FC ────────────────────
     mo.stop(recon_result is None)
 
@@ -2294,9 +2346,17 @@ def _(mo, recon_result):
 
 
 @app.cell
-def _(get_runs_version, mo, run_label, scan_result_runs, scan_wandb_runs):
+def _(
+    get_runs_version,
+    mo,
+    refresh_runs_btn,
+    run_label,
+    scan_result_runs,
+    scan_wandb_runs,
+):
     # ── Discover previous runs from disk (results/runs/ JSON + local W&B dirs) ──
     get_runs_version()  # re-discover after a run is deleted
+    refresh_runs_btn.value  # re-discover on "Refresh runs" click (dependency only)
     run_metas = {}
     try:
         _result_runs = scan_result_runs()
@@ -2352,8 +2412,14 @@ def _(mo):
     get_load_done, set_load_done = mo.state(0)
     get_delete_done, set_delete_done = mo.state(0)
     return (
-        get_delete_done, get_load_done, get_loaded_for, get_runs_version,
-        set_delete_done, set_load_done, set_loaded_for, set_runs_version,
+        get_delete_done,
+        get_load_done,
+        get_loaded_for,
+        get_runs_version,
+        set_delete_done,
+        set_load_done,
+        set_loaded_for,
+        set_runs_version,
     )
 
 
@@ -2367,11 +2433,21 @@ def _(mo):
     delete_confirm = mo.ui.checkbox(
         label="Permanently delete the results JSON and local W&B directory",
     )
-    return delete_btn, delete_confirm, load_btn
+    # Re-scans results/runs/ and W&B dirs so newly finished runs appear in every run dropdown.
+    refresh_runs_btn = mo.ui.button(value=0, on_click=lambda c: c + 1, label="Refresh runs")
+    return delete_btn, delete_confirm, load_btn, refresh_runs_btn
 
 
 @app.cell
-def _(get_load_done, load_btn, record_use, run_metas, run_selector, set_load_done, set_loaded_for):
+def _(
+    get_load_done,
+    load_btn,
+    record_use,
+    run_metas,
+    run_selector,
+    set_load_done,
+    set_loaded_for,
+):
     # Consume each Load History click exactly once: count the use and mark the selected run loaded.
     _clicks = load_btn.value
     if run_selector is not None and _clicks > get_load_done():
@@ -2435,6 +2511,7 @@ def _(
     mo,
     parse_output_log,
     plt,
+    refresh_runs_btn,
     render_history,
     run_hash,
     run_metas,
@@ -2442,12 +2519,15 @@ def _(
     stage_of,
 ):
     if not run_metas:
-        loaded_view = mo.md(
-            "⚠️ *No previous runs found. Run a fine-tuning job with W&B logging enabled, "
-            "or ensure `results/runs/` contains saved histories.*"
-        )
+        loaded_view = mo.vstack([
+            refresh_runs_btn,
+            mo.md(
+                "⚠️ *No previous runs found. Run a fine-tuning job with W&B logging enabled, "
+                "or ensure `results/runs/` contains saved histories.*"
+            ),
+        ])
     else:
-        _header = mo.hstack([run_selector, load_btn], justify="start")
+        _header = mo.hstack([run_selector, load_btn, refresh_runs_btn], justify="start")
         _sel = run_selector.value
         _meta = run_metas[_sel]
         _info = None

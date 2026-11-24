@@ -19,7 +19,7 @@ from OCD_symphony.data_preparation.make_hcp_dataset import (
     split_inner_train_val,
     subject_overlap,
     apply_label_permutation,
-    DATASET_DIRS,
+    dataset_dirs,
 )
 
 
@@ -53,12 +53,14 @@ def load_training_dataset(args, progress=None):
     """
     dataset_name = getattr(args, "dataset", "hcp_ya")
     n_subjs = None if dataset_name == "ocd" else args.n_subjs
+    preprocessing = getattr(args, "preprocessing", "paper")  # "legacy" routes to the old files
     return make_hcp_dataset_from_pt(
-        path=DATASET_DIRS[dataset_name],
+        path=dataset_dirs(preprocessing)[dataset_name],
         label=args.label,
         n_subjs=n_subjs,
         max_abs=getattr(args, "max_abs", 1e4),
         dataset=dataset_name,
+        preprocessing=preprocessing,
         progress=progress,
     )
 

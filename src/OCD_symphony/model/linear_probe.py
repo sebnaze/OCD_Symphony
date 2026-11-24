@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, Subset
 from OCD_symphony.utils import proj_dir
 from OCD_symphony.model.metrics import _subject_ids_and_labels
 from OCD_symphony.data_preparation.make_hcp_dataset import (
-    DATASET_DIRS,
+    dataset_dirs,
     apply_label_permutation,
     make_hcp_dataset_from_pt,
     split_kfold,
@@ -399,9 +399,16 @@ def _prepare_probe(args, progress=None):
     if eval_mode not in ("split", "cv"):
         raise ValueError(f"probe_eval must be 'split' or 'cv', got {eval_mode!r}")
     pooling = getattr(args, "pooling", DEFAULT_POOLING)
-    if pooling != ALL_POOLING and pooling not in POOLING_MODES:
-        raise ValueError(f"pooling must be one of {POOLING_MODES + (ALL_POOLING,)}, got {pooling!r}")
-    modes = POOLING_ALL_ORDER if pooling == ALL_POOLING else (pooling,)
+    # A list/tuple selects several modes (fitted in the given order from one extraction pass).
+    multi = isinstance(pooling, (list, tuple))
+    if multi:
+        modes = tuple(dict.fromkeys(pooling))
+        if not modes or any(m not in POOLING_MODES for m in modes):
+            raise ValueError(f"pooling list must contain only {POOLING_MODES}, got {pooling!r}")
+    else:
+        if pooling != ALL_POOLING and pooling not in POOLING_MODES:
+            raise ValueError(f"pooling must be one of {POOLING_MODES + (ALL_POOLING,)}, got {pooling!r}")
+        modes = POOLING_ALL_ORDER if pooling == ALL_POOLING else (pooling,)
     # Label-permutation null: n_permutations N > 0 runs N permuted evaluations (seeds
     # seed0..seed0+N-1). shuffle_labels alone means a single permuted run (N = 1).
     n_perm = int(getattr(args, "n_permutations", 0) or 0)
@@ -419,12 +426,14 @@ def _prepare_probe(args, progress=None):
     # Subject-level scope: one row per subject, so only subject-level folds are meaningful.
     protocol = "subject" if subject_scope else (getattr(args, "split_protocol", "subject") or "subject")
     n_subjs = None if dataset_name == "ocd" else args.n_subjs  # OCD: always all subjects
+    preprocessing = getattr(args, "preprocessing", "paper")  # "legacy" routes to the old files
     dataset, subjs = make_hcp_dataset_from_pt(
-        path=DATASET_DIRS[dataset_name],
+        path=dataset_dirs(preprocessing)[dataset_name],
         label=args.label,
         n_subjs=n_subjs,
         max_abs=getattr(args, "max_abs", 1e4),
         dataset=dataset_name,
+        preprocessing=preprocessing,
     )
     is_regression = dataset.task == "regression"
     fit_probe = fit_ridge_probe if is_regression else fit_logreg_probe
@@ -439,7 +448,7 @@ def _prepare_probe(args, progress=None):
     features = _extract_features(dataset, models, device, modes, roi_networks, subject_scope, progress)
 
     return {
-        "args": args, "progress": progress, "pooling_all": pooling == ALL_POOLING, "modes": modes,
+        "args": args, "progress": progress, "pooling_all": multi or pooling == ALL_POOLING, "modes": modes,
         "dataset": dataset, "dataset_name": dataset_name, "subjs": subjs,
         "win_subj": np.asarray(dataset.subjs), "subject_scope": subject_scope, "protocol": protocol,
         "eval_mode": eval_mode, "n_folds": n_folds, "n_perm": n_perm, "seed0": seed0,
@@ -457,10 +466,10 @@ def run_logreg_probe(args, progress=None):
         CV). Inside each outer fold, C (and the PCA fit, if used) uses only the inner
         train split from ``split_fold_data``; the outer test fold is scored once.
 
-    ``args.pooling``: one of ``feature``, ``roi``, ``network``, ``pca`` (default ``pca``), or
-    ``all``. ``all`` extracts latents once and fits every mode in ``POOLING_ALL_ORDER``
-    sequentially; it returns a list of (payload, saved_json_path), one per mode. Any single
-    mode returns one (payload, saved_json_path).
+    ``args.pooling``: one of ``feature``, ``roi``, ``network``, ``pca`` (default ``pca``), ``all``,
+    or a list/tuple of those modes. ``all`` and lists extract latents once and fit every requested
+    mode sequentially (in the given order); they return a list of (payload, saved_json_path), one
+    per mode. A single mode string returns one (payload, saved_json_path).
 
     ``args.target_scope``: ``"sample"`` (default) classifies each window. ``"subject"`` averages
     each subject's pooled latents over its windows and classifies one row per subject; folds are

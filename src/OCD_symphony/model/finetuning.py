@@ -146,6 +146,8 @@ def get_experiment_tag(args, mode: str, fold_idx: int = None) -> str:
     dataset_str = cfg.dataset
     # Dataset prefix (HCP_YA / OCD): keeps checkpoints and run files of the two datasets apart.
     prefix = f"{DATASET_TAGS.get(dataset_str, dataset_str.upper())}_"
+    if getattr(args, "preprocessing", "paper") == "legacy":
+        prefix = prefix[:-1] + "_legacy_"  # keeps legacy and paper-mode run files apart
     stage_str = "stage1" if cfg.freeze_perceiver else "stage2"
     pool_str = cfg.pooling
 
@@ -1200,7 +1202,13 @@ def parse_args():
         '--label_perm_seed', type=int, default=None,
         help='Seed for the label permutation (default: --seed).'
     )
+    parser.add_argument(
+        '--legacy', action='store_true',
+        help="Use the legacy preprocessed files (data/hcp, OCD res-2 folder) and legacy "
+             "normalisation (sigma division, OCD window demeaning). Default: paper-matched preprocessing."
+    )
     args = parser.parse_args()
+    args.preprocessing = "legacy" if args.legacy else "paper"
     _validate_args(parser, args)
     return args
 
